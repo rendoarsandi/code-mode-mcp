@@ -44,6 +44,7 @@ type ExecRequest struct {
 	Code       string `json:"code"`
 	Cwd        string `json:"cwd"`
 	DryRun     bool   `json:"dryRun"`
+	DiffMode   string `json:"diffMode"`
 	AllowShell *bool  `json:"allowShell"`
 	TimeoutMs  int    `json:"timeoutMs"`
 	MaxOutByte int    `json:"maxOutputBytes"`
@@ -92,6 +93,7 @@ func (b *boundedBuffer) String() string {
 type sandbox struct {
 	root       string
 	dryRun     bool
+	diffMode   string
 	allowShell bool
 	timeout    time.Duration
 	out        *boundedBuffer
@@ -99,6 +101,31 @@ type sandbox struct {
 	editedList []string
 	diffs      []string
 	ctx        context.Context
+}
+
+func normalizeDiffMode(raw string, dryRun bool) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "none", "stat", "compact", "full":
+		return strings.ToLower(strings.TrimSpace(raw))
+	default:
+		if dryRun {
+			return "compact"
+		}
+		return "stat"
+	}
+}
+
+func (s *sandbox) formatDiff(rel, oldText, newText string) string {
+	switch s.diffMode {
+	case "none":
+		return ""
+	case "stat":
+		return makeDiffStat(rel, oldText, newText)
+	case "compact":
+		return makeSimpleDiff(rel, oldText, newText, 12)
+	default: // "full"
+		return makeSimpleDiff(rel, oldText, newText, 60)
+	}
 }
 
 func (s *sandbox) resolvePath(rel string) (string, string, error) {
@@ -308,6 +335,7 @@ func runCodeExec(req ExecRequest) ExecResult {
 	sb := &sandbox{
 		root:       absRoot,
 		dryRun:     req.DryRun,
+		diffMode:   normalizeDiffMode(req.DiffMode, req.DryRun),
 		allowShell: allowShell,
 		timeout:    time.Duration(timeoutMs) * time.Millisecond,
 		out:        &boundedBuffer{limit: maxOut},
@@ -500,7 +528,7 @@ func runCodeExec(req ExecRequest) ExecResult {
 				return vm.ToValue(map[string]any{"changed": false, "occurrences": 0, "file": rel})
 			}
 			newText := strings.ReplaceAll(oldText, target, replacement)
-			diff := makeSimpleDiff(rel, oldText, newText)
+			diff := sb.formatDiff(rel, oldText, newText)
 			if !sb.dryRun {
 				if err := os.WriteFile(abs, []byte(newText), 0644); err != nil {
 					panic(vm.NewGoError(err))
@@ -513,7 +541,11 @@ func runCodeExec(req ExecRequest) ExecResult {
 			if diff != "" && len(sb.diffs) < 20 {
 				sb.diffs = append(sb.diffs, diff)
 			}
-			return vm.ToValue(map[string]any{"changed": true, "occurrences": count, "file": rel, "dryRun": sb.dryRun, "diff": diff})
+			out := map[string]any{"changed": true, "occurrences": count, "file": rel, "dryRun": sb.dryRun}
+			if diff != "" {
+				out["diff"] = diff
+			}
+			return vm.ToValue(out)
 		},
 		"write": func(call goja.FunctionCall) goja.Value {
 			if len(call.Arguments) < 2 {
@@ -525,7 +557,7 @@ func runCodeExec(req ExecRequest) ExecResult {
 			}
 			content := call.Arguments[1].String()
 			oldBytes, _ := os.ReadFile(abs)
-			diff := makeSimpleDiff(rel, string(oldBytes), content)
+			diff := sb.formatDiff(rel, string(oldBytes), content)
 			if !sb.dryRun {
 				if err := os.MkdirAll(filepath.Dir(abs), 0755); err != nil {
 					panic(vm.NewGoError(err))

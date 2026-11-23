@@ -7,12 +7,12 @@ Instead of making dozens of sequential tool calls (`read_file`, `grep`, `edit_fi
 ## Tools Exposed
 - `code_exec` — Execute JS inside a workspace-jailed Goja VM with:
   - `print(...)` / `console.log(...)` (hard byte-capped stdout)
-  - `fs.glob(pattern?, maxFiles?)`
+  - `fs.glob(pattern?, maxFiles?)` (supports `**` and `{a,b}` brace alternation)
   - `fs.stat(path)`
   - `fs.read(path, startLine?, endLine?)`
   - `fs.grep(regex, globPattern?, maxHits?)`
-  - `fs.edit(path, target, replacement)` (exact-match + auto unified diff + `dryRun` support)
-  - `fs.write(path, content)` (`dryRun` support)
+  - `fs.edit(path, target, replacement)` (exact-match + `diffMode: "stat" | "compact" | "full" | "none"` + `dryRun`)
+  - `fs.write(path, content)` (`dryRun` + `diffMode` support)
   - `git.status()` / `git.diff(statOnly?)`
   - `sh.run(command)` (optional, can be disabled via `allowShell: false`)
 - `code_api` — Returns the concise JS helper reference.

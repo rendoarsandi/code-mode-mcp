@@ -56,6 +56,7 @@ sh (when allowShell !== false):
 
 Notes:
   - Set dryRun: true to preview fs.edit / fs.write diffs without modifying disk.
+  - diffMode: "stat" (default for writes), "compact" (default for dryRun), "full", or "none" to keep multi-edit responses inline.
   - Set allowShell: false for pure read/edit sandboxing with zero shell execution.
   - Timeout defaults to 15000ms (max 120000ms); stdout defaults to 7500 bytes (max 65536) to stay inline without spillover.`
 
@@ -78,6 +79,11 @@ func toolsList() []map[string]any {
 					"dryRun": map[string]any{
 						"type":        "boolean",
 						"description": "If true, fs.edit and fs.write compute and return unified diffs without modifying files on disk.",
+					},
+					"diffMode": map[string]any{
+						"type":        "string",
+						"enum":        []string{"stat", "compact", "full", "none"},
+						"description": "Controls diff verbosity in the response: 'stat' (default for writes, one-line +/- summary), 'compact' (default for dryRun, up to 12 changed lines), 'full' (up to 60 changed lines), or 'none' (omit diffs).",
 					},
 					"allowShell": map[string]any{
 						"type":        "boolean",

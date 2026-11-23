@@ -46,7 +46,7 @@ func TestCodeExecGlobGrepReadEditAndDryRun(t *testing.T) {
 		t.Fatalf("dryRun modified disk!")
 	}
 
-	// 2. Real edit
+	// 2. Real edit (defaults to diffMode="stat")
 	res2 := runCodeExec(ExecRequest{
 		Cwd:  tmp,
 		Code: `fs.edit("src/app.js", "const a = 1;", "const a = 99;");`,
@@ -54,9 +54,22 @@ func TestCodeExecGlobGrepReadEditAndDryRun(t *testing.T) {
 	if res2.Error != "" {
 		t.Fatalf("unexpected error: %s", res2.Error)
 	}
+	if len(res2.Diffs) != 1 || !strings.Contains(res2.Diffs[0], "src/app.js (+1/-1 lines)") {
+		t.Fatalf("expected stat diff by default, got: %#v", res2.Diffs)
+	}
 	disk2, _ := os.ReadFile(filepath.Join(tmp, "src", "app.js"))
 	if !strings.Contains(string(disk2), "const a = 99;") {
 		t.Fatalf("real edit did not persist: %s", string(disk2))
+	}
+
+	// 3. diffMode="none" omits diffs
+	res3 := runCodeExec(ExecRequest{
+		Cwd:      tmp,
+		DiffMode: "none",
+		Code:     `fs.edit("src/app.js", "const a = 99;", "const a = 100;");`,
+	})
+	if res3.Error != "" || len(res3.Diffs) != 0 {
+		t.Fatalf("expected no diffs with diffMode=none, got err=%q diffs=%#v", res3.Error, res3.Diffs)
 	}
 }
 

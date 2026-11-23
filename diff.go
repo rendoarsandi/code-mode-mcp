@@ -5,20 +5,50 @@ import (
 	"strings"
 )
 
-// makeSimpleDiff produces a compact unified-style diff showing changed line ranges.
-func makeSimpleDiff(path, oldText, newText string) string {
+// diffStats counts removed and added lines in the changed region.
+func diffStats(oldText, newText string) (added, removed int) {
 	if oldText == newText {
-		return ""
+		return 0, 0
 	}
 	oldLines := strings.Split(oldText, "\n")
 	newLines := strings.Split(newText, "\n")
-
-	// Find common prefix
 	prefix := 0
 	for prefix < len(oldLines) && prefix < len(newLines) && oldLines[prefix] == newLines[prefix] {
 		prefix++
 	}
-	// Find common suffix
+	oldEnd := len(oldLines)
+	newEnd := len(newLines)
+	for oldEnd > prefix && newEnd > prefix && oldLines[oldEnd-1] == newLines[newEnd-1] {
+		oldEnd--
+		newEnd--
+	}
+	return newEnd - prefix, oldEnd - prefix
+}
+
+// makeDiffStat produces a one-line summary like "src/app.js (+2/-1 lines)".
+func makeDiffStat(path, oldText, newText string) string {
+	added, removed := diffStats(oldText, newText)
+	if added == 0 && removed == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s (+%d/-%d lines)", path, added, removed)
+}
+
+// makeSimpleDiff produces a compact unified-style diff showing changed line ranges.
+func makeSimpleDiff(path, oldText, newText string, maxDiffLines int) string {
+	if oldText == newText {
+		return ""
+	}
+	if maxDiffLines <= 0 {
+		maxDiffLines = 60
+	}
+	oldLines := strings.Split(oldText, "\n")
+	newLines := strings.Split(newText, "\n")
+
+	prefix := 0
+	for prefix < len(oldLines) && prefix < len(newLines) && oldLines[prefix] == newLines[prefix] {
+		prefix++
+	}
 	oldEnd := len(oldLines)
 	newEnd := len(newLines)
 	for oldEnd > prefix && newEnd > prefix && oldLines[oldEnd-1] == newLines[newEnd-1] {
@@ -44,7 +74,6 @@ func makeSimpleDiff(path, oldText, newText string) string {
 	for i := ctxStart; i < prefix; i++ {
 		b.WriteString(" " + oldLines[i] + "\n")
 	}
-	const maxDiffLines = 60
 	shown := 0
 	for i := prefix; i < oldEnd; i++ {
 		if shown < maxDiffLines {
