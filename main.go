@@ -44,7 +44,7 @@ fs (workspace-jailed to cwd):
   fs.stat(path)                          -> { exists, path, isDir, size, lines? }
   fs.read(path, startLine?, endLine?)    -> string (1-indexed inclusive line slice)
   fs.readLines(path, startLine?, end?)   -> string (1-indexed numbered lines "  12: ...")
-  fs.readFn(path, symbol, maxLines?)     -> { found, file, symbol, startLine, endLine, text } (full fn/class ±2 lines)
+  fs.readFn(path, symbol, maxLines?)     -> { found, file, symbol, startLine, endLine, text, suggestions? } (full fn/class ±2 lines; closest symbol suggestions when not found)
   fs.grep(regex, globPattern?, maxHits?) -> [{ file, line, text }] (accepts string or /RegExp/i; validates arg order)
   fs.edit(path, target, replacement, opts?)
                                          -> { changed, occurrences, file, dryRun, diff? }

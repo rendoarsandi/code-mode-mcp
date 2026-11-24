@@ -729,22 +729,33 @@ func runCodeExec(req ExecRequest) ExecResult {
 			totalOcc := 0
 			editsApplied := 0
 
+			previewTarget := func(s string) string {
+				clean := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\n", "\\n"))
+				r := []rune(clean)
+				if len(r) > 40 {
+					return string(r[:40]) + "..."
+				}
+				return clean
+			}
+
 			for idx, sp := range specs {
 				count := strings.Count(curText, sp.target)
 				if count == 0 {
 					if sp.optional {
 						continue
 					}
+					prev := previewTarget(sp.target)
 					if isMulti {
-						panic(vm.NewGoError(fmt.Errorf("fs.edit: edit[%d] target not found in %s (pass { optional: true } to ignore)", idx, rel)))
+						panic(vm.NewGoError(fmt.Errorf("fs.edit: edit[%d] target %q not found in %s (pass { optional: true } to ignore)", idx, prev, rel)))
 					}
-					panic(vm.NewGoError(fmt.Errorf("fs.edit: target not found in %s (pass { optional: true } to ignore)", rel)))
+					panic(vm.NewGoError(fmt.Errorf("fs.edit: target %q not found in %s (pass { optional: true } to ignore)", prev, rel)))
 				}
 				if count > 1 && !sp.replaceAll {
+					prev := previewTarget(sp.target)
 					if isMulti {
-						panic(vm.NewGoError(fmt.Errorf("fs.edit: edit[%d] target matched %d times in %s (pass { replaceAll: true } or add surrounding context)", idx, count, rel)))
+						panic(vm.NewGoError(fmt.Errorf("fs.edit: edit[%d] target %q matched %d times in %s (pass { replaceAll: true } or add surrounding context)", idx, prev, count, rel)))
 					}
-					panic(vm.NewGoError(fmt.Errorf("fs.edit: target matched %d times in %s (pass { replaceAll: true } or add surrounding context)", count, rel)))
+					panic(vm.NewGoError(fmt.Errorf("fs.edit: target %q matched %d times in %s (pass { replaceAll: true } or add surrounding context)", prev, count, rel)))
 				}
 				if sp.replaceAll {
 					curText = strings.ReplaceAll(curText, sp.target, sp.replacement)

@@ -4,17 +4,129 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 )
 
 type readFnResult struct {
-	Found     bool   `json:"found"`
-	File      string `json:"file"`
-	Symbol    string `json:"symbol"`
-	StartLine int    `json:"startLine,omitempty"`
-	EndLine   int    `json:"endLine,omitempty"`
-	Truncated bool   `json:"truncated,omitempty"`
-	Text      string `json:"text,omitempty"`
+	Found       bool     `json:"found"`
+	File        string   `json:"file"`
+	Symbol      string   `json:"symbol"`
+	StartLine   int      `json:"startLine,omitempty"`
+	EndLine     int      `json:"endLine,omitempty"`
+	Truncated   bool     `json:"truncated,omitempty"`
+	Text        string   `json:"text,omitempty"`
+	Suggestions []string `json:"suggestions,omitempty"`
+}
+
+var symbolExtractors = []*regexp.Regexp{
+	regexp.MustCompile(`^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)`),
+	regexp.MustCompile(`^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\(|function\b|[A-Za-z_$][\w$]*\s*=>)`),
+	regexp.MustCompile(`^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)\s*\(`),
+	regexp.MustCompile(`^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(`),
+	regexp.MustCompile(`^\s*(?:export\s+)?(?:default\s+)?class\s+([A-Za-z_$][\w$]*)`),
+	regexp.MustCompile(`^\s*(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)`),
+	regexp.MustCompile(`^\s*(?:async\s+)?([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{`),
+	regexp.MustCompile(`^\s*([A-Za-z_$][\w$]*)\s*:\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>)`),
+}
+
+var ignoredControlKeywords = map[string]bool{
+	"if": true, "for": true, "while": true, "switch": true, "catch": true,
+	"else": true, "return": true, "try": true, "finally": true, "with": true,
+}
+
+func levenshtein(a, b string) int {
+	ra, rb := []rune(a), []rune(b)
+	if len(ra) == 0 {
+		return len(rb)
+	}
+	if len(rb) == 0 {
+		return len(ra)
+	}
+	prev := make([]int, len(rb)+1)
+	curr := make([]int, len(rb)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(ra); i++ {
+		curr[0] = i
+		for j := 1; j <= len(rb); j++ {
+			cost := 1
+			if ra[i-1] == rb[j-1] {
+				cost = 0
+			}
+			del := prev[j] + 1
+			ins := curr[j-1] + 1
+			sub := prev[j-1] + cost
+			m := del
+			if ins < m {
+				m = ins
+			}
+			if sub < m {
+				m = sub
+			}
+			curr[j] = m
+		}
+		prev, curr = curr, prev
+	}
+	return prev[len(rb)]
+}
+
+func suggestSymbols(lines []string, target string, maxSuggestions int) []string {
+	seen := make(map[string]bool)
+	var all []string
+	for _, line := range lines {
+		for _, re := range symbolExtractors {
+			if m := re.FindStringSubmatch(line); len(m) == 2 {
+				name := m[1]
+				if !ignoredControlKeywords[name] && !seen[name] {
+					seen[name] = true
+					all = append(all, name)
+				}
+				break
+			}
+		}
+	}
+	if len(all) == 0 {
+		return nil
+	}
+	tl := strings.ToLower(target)
+	type scored struct {
+		name  string
+		score int
+	}
+	ranked := make([]scored, 0, len(all))
+	for _, name := range all {
+		nl := strings.ToLower(name)
+		// Lower score is better.
+		s := levenshtein(tl, nl) * 10
+		if strings.HasPrefix(nl, tl) || strings.HasPrefix(tl, nl) {
+			s -= 60
+		} else if strings.Contains(nl, tl) || strings.Contains(tl, nl) {
+			s -= 40
+		}
+		// Shared prefix length bonus (e.g. createPlayerEntity vs createPlayerForPeer)
+		shared := 0
+		for shared < len(tl) && shared < len(nl) && tl[shared] == nl[shared] {
+			shared++
+		}
+		s -= shared * 4
+		ranked = append(ranked, scored{name: name, score: s})
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		if ranked[i].score != ranked[j].score {
+			return ranked[i].score < ranked[j].score
+		}
+		return ranked[i].name < ranked[j].name
+	})
+	if len(ranked) > maxSuggestions {
+		ranked = ranked[:maxSuggestions]
+	}
+	out := make([]string, len(ranked))
+	for i, r := range ranked {
+		out[i] = r.name
+	}
+	return out
 }
 
 func formatNumberedLines(lines []string, startLine int) string {
@@ -131,7 +243,12 @@ func extractFunction(rel, text, symbol string, maxLines int) readFnResult {
 	}
 
 	if defIdx < 0 {
-		return readFnResult{Found: false, File: rel, Symbol: symbol}
+		return readFnResult{
+			Found:       false,
+			File:        rel,
+			Symbol:      symbol,
+			Suggestions: suggestSymbols(lines, symbol, 5),
+		}
 	}
 
 	isPy := strings.EqualFold(filepath.Ext(rel), ".py")

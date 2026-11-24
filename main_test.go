@@ -101,13 +101,13 @@ func TestEditStrictnessMultiEditAndPerHunkDiff(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 1. Unmatched target throws by default
+	// 1. Unmatched target throws by default with target preview
 	res := runCodeExec(ExecRequest{
 		Cwd:  tmp,
 		Code: `fs.edit("big.js", "NO_SUCH_TEXT", "X");`,
 	})
-	if !strings.Contains(res.Error, "target not found") {
-		t.Fatalf("expected target not found error, got: %+v", res)
+	if !strings.Contains(res.Error, `"NO_SUCH_TEXT" not found`) {
+		t.Fatalf("expected target preview + not found error, got: %+v", res)
 	}
 
 	// 2. Unmatched target succeeds silently with { optional: true }
@@ -150,8 +150,8 @@ func TestEditStrictnessMultiEditAndPerHunkDiff(t *testing.T) {
 			{ target: "DOES_NOT_EXIST", replacement: "OOPS" }
 		]);`,
 	})
-	if !strings.Contains(resFailMulti.Error, "edit[1] target not found") {
-		t.Fatalf("expected edit[1] error, got: %+v", resFailMulti)
+	if !strings.Contains(resFailMulti.Error, `edit[1] target "DOES_NOT_EXIST" not found`) {
+		t.Fatalf("expected edit[1] error with target preview, got: %+v", resFailMulti)
 	}
 	afterFailAtomic, _ := os.ReadFile(fp)
 	if string(afterFailAtomic) != string(beforeAtomic) {
@@ -251,6 +251,24 @@ def next_fn():
 	}
 	if !strings.Contains(resPy.Stdout, "   1: def helper(x):") || !strings.Contains(resPy.Stdout, "   4:     return 0") {
 		t.Fatalf("expected full Python function body, got:\n%s", resPy.Stdout)
+	}
+
+	// 6. fs.readFn returns ranked suggestions when symbol is slightly misnamed
+	_ = os.WriteFile(filepath.Join(tmp, "room.js"), []byte(`
+function createPlayerForPeer(peer) { return peer; }
+function startMatch() {}
+function broadcastLobby() {}
+`), 0644)
+	resMiss := runCodeExec(ExecRequest{
+		Cwd:  tmp,
+		Code: `fs.readFn("room.js", "createPlayerEntity");`,
+	})
+	if resMiss.Error != "" {
+		t.Fatalf("readFn miss unexpected error: %s", resMiss.Error)
+	}
+	missJSON, _ := json.Marshal(resMiss.Result)
+	if !strings.Contains(string(missJSON), `"found":false`) || !strings.Contains(string(missJSON), `"createPlayerForPeer"`) {
+		t.Fatalf("expected suggestions containing createPlayerForPeer, got: %s", string(missJSON))
 	}
 }
 
