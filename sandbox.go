@@ -1000,42 +1000,44 @@ func runCodeExec(req ExecRequest) ExecResult {
 		},
 	})
 
-	// sh API
-	_ = vm.Set("sh", map[string]any{
-		"run": func(call goja.FunctionCall) goja.Value {
-			if sb.readOnly || !sb.allowShell {
-				panic(vm.NewGoError(errors.New("sh.run is disabled (readOnly or allowShell=false)")))
-			}
-			if len(call.Arguments) < 1 {
-				panic(vm.NewTypeError("sh.run(command) requires command"))
-			}
-			// Auto-commit staged edits so tests/builds invoked via sh.run see the updated files.
-			if err := sb.commitStaged(); err != nil {
-				panic(vm.NewGoError(err))
-			}
-			cmdStr := call.Arguments[0].String()
-			cmd := exec.CommandContext(sb.ctx, "sh", "-c", cmdStr)
-			cmd.Dir = sb.root
-			var stdout, stderr bytes.Buffer
-			cmd.Stdout = &stdout
-			cmd.Stderr = &stderr
-			err := cmd.Run()
-			code := 0
-			if err != nil {
-				var exitErr *exec.ExitError
-				if errors.As(err, &exitErr) {
-					code = exitErr.ExitCode()
-				} else {
-					code = -1
+	// sh API (omitted entirely in read-only code_read mode)
+	if !sb.readOnly {
+		_ = vm.Set("sh", map[string]any{
+			"run": func(call goja.FunctionCall) goja.Value {
+				if !sb.allowShell {
+					panic(vm.NewGoError(errors.New("sh.run is disabled (allowShell=false)")))
 				}
-			}
-			return vm.ToValue(map[string]any{
-				"code":   code,
-				"stdout": stdout.String(),
-				"stderr": stderr.String(),
-			})
-		},
-	})
+				if len(call.Arguments) < 1 {
+					panic(vm.NewTypeError("sh.run(command) requires command"))
+				}
+				// Auto-commit staged edits so tests/builds invoked via sh.run see the updated files.
+				if err := sb.commitStaged(); err != nil {
+					panic(vm.NewGoError(err))
+				}
+				cmdStr := call.Arguments[0].String()
+				cmd := exec.CommandContext(sb.ctx, "sh", "-c", cmdStr)
+				cmd.Dir = sb.root
+				var stdout, stderr bytes.Buffer
+				cmd.Stdout = &stdout
+				cmd.Stderr = &stderr
+				err := cmd.Run()
+				code := 0
+				if err != nil {
+					var exitErr *exec.ExitError
+					if errors.As(err, &exitErr) {
+						code = exitErr.ExitCode()
+					} else {
+						code = -1
+					}
+				}
+				return vm.ToValue(map[string]any{
+					"code":   code,
+					"stdout": stdout.String(),
+					"stderr": stderr.String(),
+				})
+			},
+		})
+	}
 
 	val, runErr := vm.RunString(req.Code)
 	if runErr != nil {

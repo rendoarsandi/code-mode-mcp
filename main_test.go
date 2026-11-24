@@ -416,9 +416,9 @@ func TestCodeReadToolAndEditLines(t *testing.T) {
 	fp := filepath.Join(tmp, "tpl.js")
 	_ = os.WriteFile(fp, []byte("const title = 'hi';\nconst msg = `hello ${name}\\nworld`;\nconst end = true;\n"), 0644)
 
-	// 1. code_read via MCP RPC allows read but blocks writes & shell
+	// 1. code_read via MCP RPC allows read, omits sh (typeof sh === 'undefined'), and blocks writes
 	input := strings.Join([]string{
-		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"code_read","arguments":{"cwd":` + mustJSON(tmp) + `,"code":"print(fs.readLines('tpl.js', 1, 2));"}}}`,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"code_read","arguments":{"cwd":` + mustJSON(tmp) + `,"code":"print(fs.readLines('tpl.js', 1, 2)); typeof sh;"}}}`,
 		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"code_read","arguments":{"cwd":` + mustJSON(tmp) + `,"code":"fs.write('hack.txt', 'no');"}}}`,
 		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"code_read","arguments":{"cwd":` + mustJSON(tmp) + `,"code":"sh.run('echo nope');"}}}`,
 	}, "\n") + "\n"
@@ -431,8 +431,8 @@ func TestCodeReadToolAndEditLines(t *testing.T) {
 	if len(lines) != 3 {
 		t.Fatalf("expected 3 responses, got %d", len(lines))
 	}
-	if !strings.Contains(lines[0], "const title") || strings.Contains(lines[0], `"isError":true`) {
-		t.Fatalf("expected code_read readLines to succeed: %s", lines[0])
+	if !strings.Contains(lines[0], "const title") || !strings.Contains(lines[0], "undefined") || strings.Contains(lines[0], `"isError":true`) {
+		t.Fatalf("expected code_read readLines + typeof sh === 'undefined': %s", lines[0])
 	}
 	if !strings.Contains(lines[1], `"isError":true`) {
 		t.Fatalf("expected code_read fs.write to fail: %s", lines[1])
