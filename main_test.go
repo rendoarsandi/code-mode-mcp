@@ -363,3 +363,108 @@ func TestMCPStdioHandshakeAndCall(t *testing.T) {
 		t.Fatalf("expected hello mcp in output: %s", lines[2])
 	}
 }
+
+func TestCrossFileAtomicRollbackAndCommit(t *testing.T) {
+	tmp := t.TempDir()
+	aPath := filepath.Join(tmp, "a.js")
+	bPath := filepath.Join(tmp, "b.js")
+	_ = os.WriteFile(aPath, []byte("const a = 1;\n"), 0644)
+	_ = os.WriteFile(bPath, []byte("const b = 2;\n"), 0644)
+
+	// 1. File #1 succeeds, file #2 fails -> atomic rollback leaves a.js untouched on disk!
+	resFail := runCodeExec(ExecRequest{
+		Cwd: tmp,
+		Code: `
+			fs.edit("a.js", "const a = 1;", "const a = 999;");
+			fs.edit("b.js", "DOES_NOT_MATCH", "const b = 888;");
+		`,
+	})
+	if resFail.Error == "" || !resFail.RolledBack {
+		t.Fatalf("expected error + RolledBack=true, got: %+v", resFail)
+	}
+	if len(resFail.EditedFiles) != 0 {
+		t.Fatalf("expected 0 editedFiles after rollback, got: %#v", resFail.EditedFiles)
+	}
+	diskA, _ := os.ReadFile(aPath)
+	if string(diskA) != "const a = 1;\n" {
+		t.Fatalf("rollback failed: a.js was modified on disk: %q", string(diskA))
+	}
+
+	// 2. Same-script read sees staged edit + sh.run auto-commits so tests see new files
+	resOk := runCodeExec(ExecRequest{
+		Cwd: tmp,
+		Code: `
+			fs.edit("a.js", "const a = 1;", "const a = 42;");
+			var staged = fs.read("a.js");
+			if (staged.indexOf("42") === -1) throw new Error("read did not see staged edit");
+			fs.edit("b.js", "const b = 2;", "const b = 84;");
+			var shRes = sh.run("cat a.js");
+			print("sh=" + shRes.stdout.trim());
+		`,
+	})
+	if resOk.Error != "" || !strings.Contains(resOk.Stdout, "sh=const a = 42;") {
+		t.Fatalf("expected atomic commit + sh.run visibility, got: %+v", resOk)
+	}
+	diskB, _ := os.ReadFile(bPath)
+	if string(diskB) != "const b = 84;\n" {
+		t.Fatalf("b.js did not persist: %q", string(diskB))
+	}
+}
+
+func TestCodeReadToolAndEditLines(t *testing.T) {
+	tmp := t.TempDir()
+	fp := filepath.Join(tmp, "tpl.js")
+	_ = os.WriteFile(fp, []byte("const title = 'hi';\nconst msg = `hello ${name}\\nworld`;\nconst end = true;\n"), 0644)
+
+	// 1. code_read via MCP RPC allows read but blocks writes & shell
+	input := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"code_read","arguments":{"cwd":` + mustJSON(tmp) + `,"code":"print(fs.readLines('tpl.js', 1, 2));"}}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"code_read","arguments":{"cwd":` + mustJSON(tmp) + `,"code":"fs.write('hack.txt', 'no');"}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"code_read","arguments":{"cwd":` + mustJSON(tmp) + `,"code":"sh.run('echo nope');"}}}`,
+	}, "\n") + "\n"
+
+	var out bytes.Buffer
+	if err := serveStdio(strings.NewReader(input), &out); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 responses, got %d", len(lines))
+	}
+	if !strings.Contains(lines[0], "const title") || strings.Contains(lines[0], `"isError":true`) {
+		t.Fatalf("expected code_read readLines to succeed: %s", lines[0])
+	}
+	if !strings.Contains(lines[1], `"isError":true`) {
+		t.Fatalf("expected code_read fs.write to fail: %s", lines[1])
+	}
+	if !strings.Contains(lines[2], `"isError":true`) {
+		t.Fatalf("expected code_read sh.run to fail: %s", lines[2])
+	}
+
+	// 2. fs.editLines rejects wrong expectStart
+	resBadExpect := runCodeExec(ExecRequest{
+		Cwd:  tmp,
+		Code: `fs.editLines("tpl.js", 2, 2, "const msg = 'clean';", { expectStart: "WRONG_PREFIX" });`,
+	})
+	if !strings.Contains(resBadExpect.Error, "does not contain expectStart") {
+		t.Fatalf("expected expectStart mismatch error, got: %+v", resBadExpect)
+	}
+
+	// 3. fs.editLines replaces line 2 cleanly without escaping template literal target
+	resLine := runCodeExec(ExecRequest{
+		Cwd:  tmp,
+		Code: `fs.editLines("tpl.js", 2, 2, "const msg = 'clean';", { expectStart: "const msg" });`,
+	})
+	if resLine.Error != "" {
+		t.Fatalf("fs.editLines failed: %s", resLine.Error)
+	}
+	disk, _ := os.ReadFile(fp)
+	if string(disk) != "const title = 'hi';\nconst msg = 'clean';\nconst end = true;\n" {
+		t.Fatalf("unexpected tpl.js content: %q", string(disk))
+	}
+}
+
+func mustJSON(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}

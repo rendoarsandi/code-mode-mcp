@@ -36,6 +36,12 @@ type rpcResponse struct {
 
 const apiReference = `Code Mode MCP — JavaScript Host API (runs in sandboxed Goja JS VM):
 
+Tools:
+  code_read  -> STRICTLY READ-ONLY (fs.glob/stat/read/readLines/readFn/grep, git.status/diff).
+                Safe to auto-approve; zero write or shell blast radius.
+  code_exec  -> Full read/write/shell with cross-file atomic staging (commits to disk only if
+                the script completes without error, or before sh.run / explicit fs.commit()).
+
 Globals:
   print(...args) / console.log(...args)  -> append to capped stdout
 
@@ -44,25 +50,30 @@ fs (workspace-jailed to cwd):
   fs.stat(path)                          -> { exists, path, isDir, size, lines? }
   fs.read(path, startLine?, endLine?)    -> string (1-indexed inclusive line slice)
   fs.readLines(path, startLine?, end?)   -> string (1-indexed numbered lines "  12: ...")
-  fs.readFn(path, symbol, maxLines?)     -> { found, file, symbol, startLine, endLine, text, suggestions? } (full fn/class ±2 lines; closest symbol suggestions when not found)
+  fs.readFn(path, symbol, maxLines?)     -> { found, file, symbol, startLine, endLine, text, suggestions? }
   fs.grep(regex, globPattern?, maxHits?) -> [{ file, line, text }] (accepts string or /RegExp/i; validates arg order)
   fs.edit(path, target, replacement, opts?)
                                          -> { changed, occurrences, file, dryRun, diff? }
                                             Throws if target matches 0 times (unless opts.optional)
                                             or >1 times (unless opts.replaceAll).
   fs.edit(path, [{ target, replacement, optional?, replaceAll? }], opts?)
-                                         -> atomic multi-edit (validates all before writing)
+                                         -> atomic multi-edit
+  fs.editLines(path, startLine, endLine, replacement, opts?)
+                                         -> replace 1-indexed inclusive line range (avoids escaping giant targets;
+                                            optional opts.expectStart substring check on startLine)
   fs.write(path, content)                -> { written, dryRun, file, bytes }
+  fs.commit()                            -> flush staged atomic edits to disk immediately (auto-called on clean exit & before sh.run)
 
 git:
   git.status()                           -> string (git status --short)
   git.diff(statOnly?)                    -> string (git diff [--stat])
 
-sh (when allowShell !== false):
+sh (code_exec only, when allowShell !== false):
   sh.run(command)                        -> { code, stdout, stderr }
 
 Notes:
-  - Set dryRun: true to preview fs.edit / fs.write diffs without modifying disk.
+  - Cross-file edits are ATOMIC by default (atomic: true): if file #2 throws, file #1 is rolled back and disk stays untouched.
+  - Set dryRun: true to preview fs.edit / fs.editLines / fs.write diffs without modifying disk.
   - diffMode: "auto" (default: compact ±3-line unified diff for small edits within inline budget, auto-falling back to stat), "stat", "compact", "full", or "none".
   - Set allowShell: false for pure read/edit sandboxing with zero shell execution.
   - Timeout defaults to 15000ms (max 120000ms); stdout defaults to 7500 bytes (max 65536) to stay inline without spillover.`
@@ -70,14 +81,40 @@ Notes:
 func toolsList() []map[string]any {
 	return []map[string]any{
 		{
-			"name":        "code_exec",
-			"description": "Execute a sandboxed JavaScript script in a Go-hosted JS VM (Goja) to batch multi-file searches, reads, filtering, edits (with automatic diffs & dryRun), git checks, and shell commands in one tool call. Returns only distilled stdout/result + diffs.",
+			"name":        "code_read",
+			"description": "Execute a STRICTLY READ-ONLY sandboxed JavaScript script (Goja VM) for fast multi-file glob, grep, stat, read, readLines, readFn, and git.status/diff. No file writes and no shell execution — safe to auto-approve.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"code": map[string]any{
 						"type":        "string",
-						"description": "JavaScript source to execute. Globals: print, console.log, fs.{glob,stat,read,readLines,readFn,grep,edit,write}, git.{status,diff}, sh.run. Signatures: fs.grep(regexOrRegExp, globPattern?, maxHits?), fs.readFn(path, symbol), fs.edit(path, target, replacement, opts?) or fs.edit(path, [{target, replacement}], opts?).",
+						"description": "Read-only JavaScript source. Globals: print, console.log, fs.{glob,stat,read,readLines,readFn,grep}, git.{status,diff}.",
+					},
+					"cwd": map[string]any{
+						"type":        "string",
+						"description": "Workspace root directory (paths are jailed inside this directory). Defaults to server working directory.",
+					},
+					"timeoutMs": map[string]any{
+						"type":        "integer",
+						"description": "Execution timeout in milliseconds (default 15000, max 120000).",
+					},
+					"maxOutputBytes": map[string]any{
+						"type":        "integer",
+						"description": "Maximum stdout bytes returned (default 7500 to stay inline, max 65536).",
+					},
+				},
+				"required": []string{"code"},
+			},
+		},
+		{
+			"name":        "code_exec",
+			"description": "Execute a sandboxed JavaScript script in a Go-hosted JS VM (Goja) to batch multi-file reads, atomic cross-file edits (fs.edit, fs.editLines, fs.write with automatic rollback on error, diffs & dryRun), git checks, and shell commands in one tool call.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"code": map[string]any{
+						"type":        "string",
+						"description": "JavaScript source to execute. Globals: print, console.log, fs.{glob,stat,read,readLines,readFn,grep,edit,editLines,write,commit}, git.{status,diff}, sh.run. Cross-file edits are staged atomically and rolled back on any uncaught error.",
 					},
 					"cwd": map[string]any{
 						"type":        "string",
@@ -85,7 +122,11 @@ func toolsList() []map[string]any {
 					},
 					"dryRun": map[string]any{
 						"type":        "boolean",
-						"description": "If true, fs.edit and fs.write compute and return unified diffs without modifying files on disk.",
+						"description": "If true, fs.edit / fs.editLines / fs.write compute and return unified diffs without modifying files on disk.",
+					},
+					"atomic": map[string]any{
+						"type":        "boolean",
+						"description": "Stage all file edits in memory and commit to disk only if the script succeeds without error (default true). Also auto-commits before sh.run().",
 					},
 					"diffMode": map[string]any{
 						"type":        "string",
@@ -110,7 +151,7 @@ func toolsList() []map[string]any {
 		},
 		{
 			"name":        "code_api",
-			"description": "Return the concise API reference for the sandboxed JavaScript helpers available in code_exec.",
+			"description": "Return the concise API reference for the sandboxed JavaScript helpers available in code_read and code_exec.",
 			"inputSchema": map[string]any{
 				"type":       "object",
 				"properties": map[string]any{},
@@ -161,6 +202,28 @@ func handleRPC(req rpcRequest) *rpcResponse {
 				ID:      req.ID,
 				Result: map[string]any{
 					"content": []map[string]any{{"type": "text", "text": apiReference}},
+				},
+			}
+		case "code_read":
+			var execReq ExecRequest
+			if len(params.Arguments) > 0 {
+				if err := json.Unmarshal(params.Arguments, &execReq); err != nil {
+					return &rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32602, Message: "invalid arguments: " + err.Error()}}
+				}
+			}
+			allowFalse := false
+			execReq.ReadOnly = true
+			execReq.DryRun = false
+			execReq.AllowShell = &allowFalse
+			execRes := runCodeExec(execReq)
+			outJSON, _ := json.MarshalIndent(execRes, "", "  ")
+			isErr := execRes.Error != ""
+			return &rpcResponse{
+				JSONRPC: "2.0",
+				ID:      req.ID,
+				Result: map[string]any{
+					"content": []map[string]any{{"type": "text", "text": string(outJSON)}},
+					"isError": isErr,
 				},
 			}
 		case "code_exec":
