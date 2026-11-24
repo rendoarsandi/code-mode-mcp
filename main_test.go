@@ -464,6 +464,436 @@ func TestCodeReadToolAndEditLines(t *testing.T) {
 	}
 }
 
+func TestSymbolsReadFnAtPlainTextAndTruncation(t *testing.T) {
+	tmp := t.TempDir()
+	js := `// top-level config
+const MAX_CHUNKS = 64;
+const VIEW_DIST = 8;
+
+class VoxelWorld {
+  constructor(seed) {
+    this.seed = seed;
+  }
+
+  buildMesh(cx, cz) {
+    const verts = [];
+    if (cx < 0 && cz > 0) {
+      verts.push(cx, cz);
+    }
+    return verts;
+  }
+}
+
+function helper(a, b) {
+  return a + b;
+}
+`
+	if err := os.WriteFile(filepath.Join(tmp, "voxel.js"), []byte(js), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. fs.symbols extracts class, methods, and functions with line ranges
+	resSyms := runCodeExec(ExecRequest{
+		Cwd:  tmp,
+		Code: `fs.symbols("voxel.js");`,
+	})
+	if resSyms.Error != "" {
+		t.Fatalf("fs.symbols failed: %s", resSyms.Error)
+	}
+	symsJSON := marshalCompactNoEscape(resSyms.Result)
+	for _, want := range []string{`"name":"VoxelWorld"`, `"kind":"class"`, `"name":"constructor"`, `"name":"buildMesh"`, `"name":"helper"`} {
+		if !strings.Contains(symsJSON, want) {
+			t.Fatalf("expected %s in symbols output, got: %s", want, symsJSON)
+		}
+	}
+
+	// 2. fs.readFnAt picks innermost enclosing method (buildMesh), NOT outer VoxelWorld class
+	resAt := runCodeExec(ExecRequest{
+		Cwd:  tmp,
+		Code: `var r = fs.readFnAt("voxel.js", 12); print(r.text); r;`,
+	})
+	if resAt.Error != "" {
+		t.Fatalf("fs.readFnAt failed: %s", resAt.Error)
+	}
+	atJSON := marshalCompactNoEscape(resAt.Result)
+	if !strings.Contains(atJSON, `"found":true`) || !strings.Contains(atJSON, `"symbol":"buildMesh"`) {
+		t.Fatalf("expected enclosing method buildMesh, got: %s", atJSON)
+	}
+	if !strings.Contains(resAt.Stdout, "  10:   buildMesh(cx, cz) {") || !strings.Contains(resAt.Stdout, "  16:   }") {
+		t.Fatalf("expected full buildMesh body, got:\n%s", resAt.Stdout)
+	}
+
+	// 3. fs.readFnAt on top-level line returns found:false + numbered fallback context
+	resTop := runCodeExec(ExecRequest{
+		Cwd:  tmp,
+		Code: `fs.readFnAt("voxel.js", 2);`,
+	})
+	if resTop.Error != "" {
+		t.Fatalf("fs.readFnAt top-level failed: %s", resTop.Error)
+	}
+	topJSON := marshalCompactNoEscape(resTop.Result)
+	if !strings.Contains(topJSON, `"found":false`) || !strings.Contains(topJSON, `MAX_CHUNKS`) {
+		t.Fatalf("expected found:false with fallback text for top-level line, got: %s", topJSON)
+	}
+
+	// 4. Plain-text MCP formatting avoids JSON/HTML escaping (<, >, &) and reports truncation cleanly
+	resTrunc := runCodeExec(ExecRequest{
+		Cwd:        tmp,
+		MaxOutByte: 64,
+		Code:       `for (var i = 0; i < 20; i++) print("0123456789");`,
+	})
+	if !resTrunc.Truncated || resTrunc.TotalBytes != 220 {
+		t.Fatalf("expected truncated=true totalBytes=220, got truncated=%v totalBytes=%d", resTrunc.Truncated, resTrunc.TotalBytes)
+	}
+	if !strings.HasSuffix(resTrunc.Stdout, "\n") || len(resTrunc.Stdout) != 55 {
+		t.Fatalf("expected clean newline-snapped 55 bytes, got len=%d stdout=%q", len(resTrunc.Stdout), resTrunc.Stdout)
+	}
+	formatted := formatExecResult(resTrunc)
+	if !strings.Contains(formatted, "[truncated: showed 55/220 bytes (165 dropped)") {
+		t.Fatalf("expected truncation summary in formatted text, got:\n%s", formatted)
+	}
+
+	// 5. UTF-8 rune boundary safety on single-line truncation
+	resUTF8 := runCodeExec(ExecRequest{
+		Cwd:        tmp,
+		MaxOutByte: 10,
+		Code:       `print("éééééééé");`,
+	})
+	if !resUTF8.Truncated || len(resUTF8.Stdout) > 10 || len(resUTF8.Stdout)%2 != 0 {
+		t.Fatalf("expected valid UTF-8 prefix <= 10 bytes, got len=%d stdout=%q", len(resUTF8.Stdout), resUTF8.Stdout)
+	}
+
+	// 6. MCP stdio response uses plain text without \u003c / \u003e / \u0026 escaping & includes initialize instructions
+	input := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"code_read","arguments":{"cwd":` + mustJSON(tmp) + `,"code":"print('if (a < b && c > d) {}');"}}}`,
+	}, "\n") + "\n"
+	var out bytes.Buffer
+	if err := serveStdio(strings.NewReader(input), &out); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 responses, got %d", len(lines))
+	}
+	var initResp, callResp map[string]any
+	_ = json.Unmarshal([]byte(lines[0]), &initResp)
+	_ = json.Unmarshal([]byte(lines[1]), &callResp)
+	initRes := initResp["result"].(map[string]any)
+	if instr, ok := initRes["instructions"].(string); !ok || !strings.Contains(instr, "code_read") {
+		t.Fatalf("expected initialize instructions mentioning code_read, got: %v", initRes["instructions"])
+	}
+	callRes := callResp["result"].(map[string]any)
+	content := callRes["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !strings.Contains(content, "if (a < b && c > d) {}") || strings.Contains(content, `\u003c`) {
+		t.Fatalf("expected unescaped plain-text stdout, got:\n%s", content)
+	}
+}
+
+func TestHeadTailTruncationOutputCursorOutBudgetAndResultBound(t *testing.T) {
+	tmp := t.TempDir()
+
+	// 1. Head + tail preservation when limit >= 512 keeps BOTH start and trailing SUMMARY line!
+	res := runCodeExec(ExecRequest{
+		Cwd:        tmp,
+		MaxOutByte: 800,
+		Code: `
+			print("HEADER_START");
+			for (var i = 0; i < 60; i++) {
+				print("middle-line-" + i + "-payload-abcdefghij");
+			}
+			print("FINAL_SUMMARY_OK=42");
+		`,
+	})
+	if res.Error != "" {
+		t.Fatalf("unexpected error: %s", res.Error)
+	}
+	if !res.Truncated || res.OutputId == "" || res.NextOffset <= 0 {
+		t.Fatalf("expected truncated + outputId + nextOffset, got: truncated=%v id=%q next=%d", res.Truncated, res.OutputId, res.NextOffset)
+	}
+	if len(res.Stdout) > 800 {
+		t.Fatalf("expected combined head+tail <= 800 bytes, got %d", len(res.Stdout))
+	}
+	if !strings.Contains(res.Stdout, "HEADER_START") || !strings.Contains(res.Stdout, "bytes omitted") || !strings.Contains(res.Stdout, "FINAL_SUMMARY_OK=42") {
+		t.Fatalf("expected head+tail with omitted marker and trailing summary, got:\n%s", res.Stdout)
+	}
+
+	// 2. Continue reading dropped bytes via code_read({ outputId, outputOffset }) without re-running script!
+	input := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"code_read","arguments":{"outputId":` + mustJSON(res.OutputId) + `,"outputOffset":` + mustJSON(res.NextOffset) + `,"maxOutputBytes":1000}}}` + "\n"
+	var rpcOut bytes.Buffer
+	if err := serveStdio(strings.NewReader(input), &rpcOut); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rpcOut.String(), "middle-line-") || strings.Contains(rpcOut.String(), `"isError":true`) {
+		t.Fatalf("expected cached continuation chunk, got: %s", rpcOut.String())
+	}
+
+	// 3. out.{limit,used,remaining,truncated}() lets scripts budget their own output
+	resBudget := runCodeExec(ExecRequest{
+		Cwd:        tmp,
+		MaxOutByte: 200,
+		Code: `
+			var lim = out.limit();
+			print("0123456789");
+			var u1 = out.used();
+			var r1 = out.remaining();
+			var t1 = out.truncated();
+			({ lim: lim, u1: u1, r1: r1, t1: t1 });
+		`,
+	})
+	if resBudget.Error != "" {
+		t.Fatalf("out budget helper failed: %s", resBudget.Error)
+	}
+	bj := marshalCompactNoEscape(resBudget.Result)
+	if !strings.Contains(bj, `"lim":200`) || !strings.Contains(bj, `"u1":11`) || !strings.Contains(bj, `"r1":189`) || !strings.Contains(bj, `"t1":false`) {
+		t.Fatalf("unexpected out budget result: %s", bj)
+	}
+
+	// 4. Returning a huge expression directly is bounded in formatExecResult (cannot bypass maxOutputBytes)
+	resBig := runCodeExec(ExecRequest{
+		Cwd:        tmp,
+		MaxOutByte: 1200,
+		Code:       `var s = ""; for (var i = 0; i < 400; i++) s += "0123456789"; s;`,
+	})
+	formatted := formatExecResult(resBig)
+	if !strings.Contains(formatted, "[result truncated:") || len(formatted) > 1500 {
+		t.Fatalf("expected bounded res.Result in formatExecResult, got len=%d:\n%s", len(formatted), formatted[:min(300, len(formatted))])
+	}
+}
+
+func TestHardenedReadFnCommentsRegexTSGenericsAndMultiMatch(t *testing.T) {
+	tmp := t.TempDir()
+	ts := `/*
+function fakeInsideComment() {
+  return "}";
+}
+*/
+export class Engine {
+  public async buildMesh(
+    cx: number,
+    cz: number,
+  ): Promise<string> {
+    const re = /\{|\}/g;
+    const tpl = ` + "`" + `
+      } fake closing brace in template
+      ${format({ a: 1 })}
+    ` + "`" + `;
+    /* } fake closing brace in block comment */
+    return tpl.replace(re, "");
+  }
+
+  render(): void {
+    return;
+  }
+}
+
+export class Overlay {
+  render(): void {
+    return;
+  }
+}
+`
+	goSrc := `package demo
+
+func Map[T any, U any](
+	in []T,
+	fn func(T) U,
+) []U {
+	raw := ` + "`" + `
+}
+func fakeInRawString() {}
+` + "`" + `
+	_ = raw
+	return nil
+}
+`
+	_ = os.WriteFile(filepath.Join(tmp, "engine.ts"), []byte(ts), 0644)
+	_ = os.WriteFile(filepath.Join(tmp, "map.go"), []byte(goSrc), 0644)
+
+	// 1. TS multiline method with return type, regex /\{|\}/, template literal, and block comment braces
+	resTS := runCodeExec(ExecRequest{
+		Cwd:  tmp,
+		Code: `var syms = fs.symbols("engine.ts"); var fn = fs.readFn("engine.ts", "buildMesh"); ({ syms: syms, fn: fn });`,
+	})
+	if resTS.Error != "" {
+		t.Fatalf("TS readFn failed: %s", resTS.Error)
+	}
+	jTS := marshalCompactNoEscape(resTS.Result)
+	if strings.Contains(jTS, "fakeInsideComment") {
+		t.Fatalf("should skip symbols inside block comment, got: %s", jTS)
+	}
+	if !strings.Contains(jTS, `"symbol":"buildMesh"`) || !strings.Contains(jTS, `return tpl.replace(re,`) {
+		t.Fatalf("expected full buildMesh body past regex/template/comment braces, got: %s", jTS)
+	}
+
+	// 2. Multi-match reporting on duplicate method name "render"
+	resMulti := runCodeExec(ExecRequest{
+		Cwd:  tmp,
+		Code: `fs.readFn("engine.ts", "render");`,
+	})
+	jMulti := marshalCompactNoEscape(resMulti.Result)
+	if !strings.Contains(jMulti, `"matches":[20,26]`) {
+		t.Fatalf("expected matches:[20,26] for duplicate render methods, got: %s", jMulti)
+	}
+
+	// 3. Go generic function with raw backtick string containing "}" and fake func
+	resGo := runCodeExec(ExecRequest{
+		Cwd:  tmp,
+		Code: `var syms = fs.symbols("map.go"); var fn = fs.readFn("map.go", "Map"); ({ syms: syms, fn: fn });`,
+	})
+	if resGo.Error != "" {
+		t.Fatalf("Go generic readFn failed: %s", resGo.Error)
+	}
+	resGoMap := resGo.Result.(map[string]any)
+	symsGo := marshalCompactNoEscape(resGoMap["syms"])
+	fnGo := marshalCompactNoEscape(resGoMap["fn"])
+	if strings.Contains(symsGo, "fakeInRawString") || strings.Contains(symsGo, `"name":"func"`) {
+		t.Fatalf("should only extract real Go func Map, got syms: %s", symsGo)
+	}
+	if !strings.Contains(fnGo, `"symbol":"Map"`) || !strings.Contains(fnGo, `return nil`) {
+		t.Fatalf("expected full generic Go func Map body, got: %s", fnGo)
+	}
+}
+
+func TestGlobIgnoreGrepFnAndShCheck(t *testing.T) {
+	tmp := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(tmp, "src"), 0755)
+	_ = os.MkdirAll(filepath.Join(tmp, "vendor"), 0755)
+	_ = os.WriteFile(filepath.Join(tmp, "src", "a.js"), []byte("function alpha() {\n  const x = TARGET;\n  const y = TARGET;\n  return x + y;\n}\n"), 0644)
+	_ = os.WriteFile(filepath.Join(tmp, "src", "b.js"), []byte("function beta() {\n  return TARGET;\n}\n"), 0644)
+	_ = os.WriteFile(filepath.Join(tmp, "vendor", "c.js"), []byte("function ignored() { return TARGET; }\n"), 0644)
+
+	// 1. fs.glob with { maxFiles, ignore } + .truncated
+	resGlob := runCodeExec(ExecRequest{
+		Cwd: tmp,
+		Code: `
+			var all = fs.glob("**/*.js", { ignore: ["vendor/**"] });
+			var capped = fs.glob("**/*.js", { maxFiles: 1, ignore: ["vendor/**"] });
+			({ all: all, allTrunc: all.truncated, capLen: capped.length, capTrunc: capped.truncated });
+		`,
+	})
+	if resGlob.Error != "" {
+		t.Fatalf("fs.glob opts failed: %s", resGlob.Error)
+	}
+	jg := marshalCompactNoEscape(resGlob.Result)
+	if strings.Contains(jg, "vendor/c.js") || !strings.Contains(jg, `"allTrunc":false`) || !strings.Contains(jg, `"capLen":1`) || !strings.Contains(jg, `"capTrunc":true`) {
+		t.Fatalf("unexpected glob opts result: %s", jg)
+	}
+
+	// 2. fs.grepFn deduplicates hits inside alpha() and attaches hitLines
+	resGrepFn := runCodeExec(ExecRequest{
+		Cwd: tmp,
+		Code: `
+			var fns = fs.grepFn(/TARGET/, "**/*.js", { ignore: ["vendor/**"], maxFns: 5 });
+			({ count: fns.length, f0: fns[0].symbol, h0: fns[0].hitLines, f1: fns[1].symbol, trunc: fns.truncated });
+		`,
+	})
+	if resGrepFn.Error != "" {
+		t.Fatalf("fs.grepFn failed: %s", resGrepFn.Error)
+	}
+	jgf := marshalCompactNoEscape(resGrepFn.Result)
+	if !strings.Contains(jgf, `"count":2`) || !strings.Contains(jgf, `"f0":"alpha"`) || !strings.Contains(jgf, `"h0":[2,3]`) || !strings.Contains(jgf, `"f1":"beta"`) {
+		t.Fatalf("unexpected grepFn result: %s", jgf)
+	}
+
+	// 3. sh.check distills failure lines + tail
+	resCheck := runCodeExec(ExecRequest{
+		Cwd:  tmp,
+		Code: `sh.check("printf 'ok 1\\nFAIL test_auth\\nok 2\\nAssertionError: bad token\\ndone\\n'; exit 1");`,
+	})
+	if resCheck.Error != "" {
+		t.Fatalf("sh.check failed: %s", resCheck.Error)
+	}
+	jc := marshalCompactNoEscape(resCheck.Result)
+	if !strings.Contains(jc, `"ok":false`) || !strings.Contains(jc, `"code":1`) || !strings.Contains(jc, `"matchCount":2`) || !strings.Contains(jc, `FAIL test_auth`) {
+		t.Fatalf("unexpected sh.check result: %s", jc)
+	}
+}
+
+func TestEditSafetyGuardsNetDiffsAndRevert(t *testing.T) {
+	tmp := t.TempDir()
+	fp := filepath.Join(tmp, "vars.js")
+	orig := "const id = 1;\nconst width = 10;\nconst valid = id + width;\nreturn id;\n"
+	_ = os.WriteFile(fp, []byte(orig), 0644)
+
+	// 1. wholeWord: true renames identifier `id` without corrupting `width` or `valid`!
+	resWW := runCodeExec(ExecRequest{
+		Cwd:  tmp,
+		Code: `fs.edit("vars.js", "id", "userId", { wholeWord: true, expectCount: 3 });`,
+	})
+	if resWW.Error != "" {
+		t.Fatalf("wholeWord edit failed: %s", resWW.Error)
+	}
+	afterWW, _ := os.ReadFile(fp)
+	wantWW := "const userId = 1;\nconst width = 10;\nconst valid = userId + width;\nreturn userId;\n"
+	if string(afterWW) != wantWW {
+		t.Fatalf("wholeWord corrupted file:\ngot:  %q\nwant: %q", string(afterWW), wantWW)
+	}
+
+	// 2. maxReplacements rejects unexpectedly broad replaceAll and leaves file untouched
+	resMax := runCodeExec(ExecRequest{
+		Cwd:  tmp,
+		Code: `fs.edit("vars.js", "userId", "uid", { replaceAll: true, maxReplacements: 2 });`,
+	})
+	if !strings.Contains(resMax.Error, "exceeds maxReplacements=2") {
+		t.Fatalf("expected maxReplacements error, got: %+v", resMax)
+	}
+
+	// 3. editLines expectEnd rejects shifted closing line
+	resEnd := runCodeExec(ExecRequest{
+		Cwd:  tmp,
+		Code: `fs.editLines("vars.js", 1, 4, "// replaced", { expectStart: "const userId", expectEnd: "WRONG_END" });`,
+	})
+	if !strings.Contains(resEnd.Error, "does not contain expectEnd") {
+		t.Fatalf("expected expectEnd mismatch error, got: %+v", resEnd)
+	}
+
+	// 4. Net-per-file diffs: two edits to same file produce ONE diff, not two
+	resNet := runCodeExec(ExecRequest{
+		Cwd:      tmp,
+		DiffMode: "stat",
+		Code: `
+			fs.edit("vars.js", "const userId = 1;", "const userId = 2;");
+			fs.edit("vars.js", "const width = 10;", "const width = 20;");
+		`,
+	})
+	if resNet.Error != "" {
+		t.Fatalf("net diff edit failed: %s", resNet.Error)
+	}
+	if len(resNet.Diffs) != 1 || resNet.Diffs[0] != "vars.js (+2/-2 lines)" {
+		t.Fatalf("expected single consolidated net diff, got: %#v", resNet.Diffs)
+	}
+
+	// 5. fs.revert() restores disk even AFTER sh.run() auto-committed edits!
+	beforeRevert, _ := os.ReadFile(fp)
+	resRev := runCodeExec(ExecRequest{
+		Cwd: tmp,
+		Code: `
+			fs.edit("vars.js", "const userId = 2;", "const userId = 999;");
+			fs.write("temp_new.js", "hello");
+			var chk = sh.check("grep 999 vars.js && exit 1");
+			if (!chk.ok) fs.revert();
+		`,
+	})
+	if resRev.Error != "" {
+		t.Fatalf("fs.revert failed: %s", resRev.Error)
+	}
+	afterRevert, _ := os.ReadFile(fp)
+	if string(afterRevert) != string(beforeRevert) {
+		t.Fatalf("fs.revert did not restore vars.js:\ngot:  %q\nwant: %q", string(afterRevert), string(beforeRevert))
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "temp_new.js")); !os.IsNotExist(err) {
+		t.Fatalf("fs.revert did not remove newly created temp_new.js")
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func mustJSON(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
