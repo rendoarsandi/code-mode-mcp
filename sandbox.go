@@ -506,31 +506,152 @@ func runCodeExec(req ExecRequest) ExecResult {
 			return vm.ToValue(hits)
 		},
 		"edit": func(call goja.FunctionCall) goja.Value {
-			if len(call.Arguments) < 3 {
-				panic(vm.NewTypeError("fs.edit(path, target, replacement) requires 3 arguments"))
+			if len(call.Arguments) < 2 {
+				panic(vm.NewTypeError("fs.edit(path, target, replacement, opts?) or fs.edit(path, [{target, replacement}], opts?)"))
 			}
 			abs, rel, err := sb.resolvePath(call.Arguments[0].String())
 			if err != nil {
 				panic(vm.NewGoError(err))
 			}
-			target := call.Arguments[1].String()
-			replacement := call.Arguments[2].String()
-			if target == "" {
-				panic(vm.NewTypeError("fs.edit target cannot be empty"))
+
+			parseOpts := func(v goja.Value, defOpt, defAll bool) (bool, bool) {
+				optional, replaceAll := defOpt, defAll
+				if v == nil || goja.IsUndefined(v) || goja.IsNull(v) {
+					return optional, replaceAll
+				}
+				obj := v.ToObject(vm)
+				if obj == nil {
+					return optional, replaceAll
+				}
+				if ov := obj.Get("optional"); ov != nil && !goja.IsUndefined(ov) {
+					optional = ov.ToBoolean()
+				}
+				if rv := obj.Get("replaceAll"); rv != nil && !goja.IsUndefined(rv) {
+					replaceAll = rv.ToBoolean()
+				}
+				return optional, replaceAll
 			}
+
+			type editSpec struct {
+				target      string
+				replacement string
+				optional    bool
+				replaceAll  bool
+			}
+
+			isMulti := false
+			var specs []editSpec
+
+			arg1 := call.Arguments[1]
+			if arg1 != nil && !goja.IsUndefined(arg1) && !goja.IsNull(arg1) {
+				if obj, ok := arg1.(*goja.Object); ok && obj.ClassName() == "Array" {
+					isMulti = true
+					var topOpts goja.Value
+					if len(call.Arguments) >= 3 {
+						topOpts = call.Arguments[2]
+					}
+					defOpt, defAll := parseOpts(topOpts, false, false)
+					n := int(obj.Get("length").ToInteger())
+					if n == 0 {
+						panic(vm.NewTypeError("fs.edit multi-edit array cannot be empty"))
+					}
+					specs = make([]editSpec, 0, n)
+					for i := 0; i < n; i++ {
+						itemVal := obj.Get(fmt.Sprintf("%d", i))
+						if itemVal == nil || goja.IsUndefined(itemVal) || goja.IsNull(itemVal) {
+							panic(vm.NewTypeError(fmt.Sprintf("fs.edit edit[%d] must be an object", i)))
+						}
+						itemObj := itemVal.ToObject(vm)
+						tVal := itemObj.Get("target")
+						if tVal == nil || goja.IsUndefined(tVal) {
+							tVal = itemObj.Get("old")
+						}
+						rVal := itemObj.Get("replacement")
+						if rVal == nil || goja.IsUndefined(rVal) {
+							rVal = itemObj.Get("new")
+						}
+						if tVal == nil || goja.IsUndefined(tVal) || rVal == nil || goja.IsUndefined(rVal) {
+							panic(vm.NewTypeError(fmt.Sprintf("fs.edit edit[%d] requires target and replacement", i)))
+						}
+						target := tVal.String()
+						if target == "" {
+							panic(vm.NewTypeError(fmt.Sprintf("fs.edit edit[%d] target cannot be empty", i)))
+						}
+						iOpt, iAll := parseOpts(itemVal, defOpt, defAll)
+						specs = append(specs, editSpec{
+							target:      target,
+							replacement: rVal.String(),
+							optional:    iOpt,
+							replaceAll:  iAll,
+						})
+					}
+				}
+			}
+
+			if !isMulti {
+				if len(call.Arguments) < 3 {
+					panic(vm.NewTypeError("fs.edit(path, target, replacement, opts?) requires at least 3 arguments"))
+				}
+				target := call.Arguments[1].String()
+				replacement := call.Arguments[2].String()
+				if target == "" {
+					panic(vm.NewTypeError("fs.edit target cannot be empty"))
+				}
+				var optsVal goja.Value
+				if len(call.Arguments) >= 4 {
+					optsVal = call.Arguments[3]
+				}
+				opt, repAll := parseOpts(optsVal, false, false)
+				specs = []editSpec{{target: target, replacement: replacement, optional: opt, replaceAll: repAll}}
+			}
+
 			data, err := os.ReadFile(abs)
 			if err != nil {
 				panic(vm.NewGoError(err))
 			}
 			oldText := string(data)
-			count := strings.Count(oldText, target)
-			if count == 0 {
-				return vm.ToValue(map[string]any{"changed": false, "occurrences": 0, "file": rel})
+			curText := oldText
+			totalOcc := 0
+			editsApplied := 0
+
+			for idx, sp := range specs {
+				count := strings.Count(curText, sp.target)
+				if count == 0 {
+					if sp.optional {
+						continue
+					}
+					if isMulti {
+						panic(vm.NewGoError(fmt.Errorf("fs.edit: edit[%d] target not found in %s (pass { optional: true } to ignore)", idx, rel)))
+					}
+					panic(vm.NewGoError(fmt.Errorf("fs.edit: target not found in %s (pass { optional: true } to ignore)", rel)))
+				}
+				if count > 1 && !sp.replaceAll {
+					if isMulti {
+						panic(vm.NewGoError(fmt.Errorf("fs.edit: edit[%d] target matched %d times in %s (pass { replaceAll: true } or add surrounding context)", idx, count, rel)))
+					}
+					panic(vm.NewGoError(fmt.Errorf("fs.edit: target matched %d times in %s (pass { replaceAll: true } or add surrounding context)", count, rel)))
+				}
+				if sp.replaceAll {
+					curText = strings.ReplaceAll(curText, sp.target, sp.replacement)
+					totalOcc += count
+				} else {
+					curText = strings.Replace(curText, sp.target, sp.replacement, 1)
+					totalOcc += 1
+				}
+				editsApplied++
 			}
-			newText := strings.ReplaceAll(oldText, target, replacement)
-			diff := sb.formatDiff(rel, oldText, newText)
+
+			if curText == oldText {
+				out := map[string]any{"changed": false, "occurrences": 0, "file": rel, "dryRun": sb.dryRun}
+				if isMulti {
+					out["editsApplied"] = 0
+				}
+				return vm.ToValue(out)
+			}
+
+			diff := sb.formatDiff(rel, oldText, curText)
 			if !sb.dryRun {
-				if err := os.WriteFile(abs, []byte(newText), 0644); err != nil {
+				if err := os.WriteFile(abs, []byte(curText), 0644); err != nil {
 					panic(vm.NewGoError(err))
 				}
 			}
@@ -541,7 +662,10 @@ func runCodeExec(req ExecRequest) ExecResult {
 			if diff != "" && len(sb.diffs) < 20 {
 				sb.diffs = append(sb.diffs, diff)
 			}
-			out := map[string]any{"changed": true, "occurrences": count, "file": rel, "dryRun": sb.dryRun}
+			out := map[string]any{"changed": true, "occurrences": totalOcc, "file": rel, "dryRun": sb.dryRun}
+			if isMulti {
+				out["editsApplied"] = editsApplied
+			}
 			if diff != "" {
 				out["diff"] = diff
 			}

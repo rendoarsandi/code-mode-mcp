@@ -73,6 +73,97 @@ func TestCodeExecGlobGrepReadEditAndDryRun(t *testing.T) {
 	}
 }
 
+func TestEditStrictnessMultiEditAndPerHunkDiff(t *testing.T) {
+	tmp := t.TempDir()
+	// Build a 160-line file with two identical "if (flag) run();" lines far apart
+	var lines []string
+	for i := 1; i <= 160; i++ {
+		switch i {
+		case 5, 155:
+			lines = append(lines, "if (flag) run();")
+		default:
+			lines = append(lines, "const line_"+string(rune('a'+(i%26)))+" = "+strings.Repeat("x", 1)+";")
+		}
+	}
+	orig := strings.Join(lines, "\n") + "\n"
+	fp := filepath.Join(tmp, "big.js")
+	if err := os.WriteFile(fp, []byte(orig), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Unmatched target throws by default
+	res := runCodeExec(ExecRequest{
+		Cwd:  tmp,
+		Code: `fs.edit("big.js", "NO_SUCH_TEXT", "X");`,
+	})
+	if !strings.Contains(res.Error, "target not found") {
+		t.Fatalf("expected target not found error, got: %+v", res)
+	}
+
+	// 2. Unmatched target succeeds silently with { optional: true }
+	resOpt := runCodeExec(ExecRequest{
+		Cwd:  tmp,
+		Code: `fs.edit("big.js", "NO_SUCH_TEXT", "X", { optional: true });`,
+	})
+	if resOpt.Error != "" {
+		t.Fatalf("expected optional edit to succeed, got: %s", resOpt.Error)
+	}
+
+	// 3. Ambiguous (>1 match) throws by default
+	resAmb := runCodeExec(ExecRequest{
+		Cwd:  tmp,
+		Code: `fs.edit("big.js", "if (flag) run();", "if (flag) runFast();");`,
+	})
+	if !strings.Contains(resAmb.Error, "matched 2 times") {
+		t.Fatalf("expected ambiguity error, got: %+v", resAmb)
+	}
+
+	// 4. Ambiguous succeeds with { replaceAll: true } AND reports exact per-hunk (+2/-2 lines), NOT (+151/-151)!
+	resAll := runCodeExec(ExecRequest{
+		Cwd:  tmp,
+		Code: `fs.edit("big.js", "if (flag) run();", "if (flag) runFast();", { replaceAll: true });`,
+	})
+	if resAll.Error != "" {
+		t.Fatalf("expected replaceAll to succeed, got: %s", resAll.Error)
+	}
+	if len(resAll.Diffs) != 1 || resAll.Diffs[0] != "big.js (+2/-2 lines)" {
+		t.Fatalf("expected exact per-hunk stat 'big.js (+2/-2 lines)', got: %#v", resAll.Diffs)
+	}
+
+	// 5. Atomic multi-edit: fails cleanly on 2nd edit without modifying disk
+	beforeAtomic, _ := os.ReadFile(fp)
+	resFailMulti := runCodeExec(ExecRequest{
+		Cwd: tmp,
+		Code: `fs.edit("big.js", [
+			{ target: "if (flag) runFast();", replacement: "if (flag) runV2();", replaceAll: true },
+			{ target: "DOES_NOT_EXIST", replacement: "OOPS" }
+		]);`,
+	})
+	if !strings.Contains(resFailMulti.Error, "edit[1] target not found") {
+		t.Fatalf("expected edit[1] error, got: %+v", resFailMulti)
+	}
+	afterFailAtomic, _ := os.ReadFile(fp)
+	if string(afterFailAtomic) != string(beforeAtomic) {
+		t.Fatalf("failed atomic multi-edit modified disk!")
+	}
+
+	// 6. Atomic multi-edit succeeds when all match
+	resOkMulti := runCodeExec(ExecRequest{
+		Cwd:      tmp,
+		DiffMode: "compact",
+		Code: `fs.edit("big.js", [
+			{ target: "if (flag) runFast();", replacement: "if (flag) runV2();", replaceAll: true },
+			{ target: "MISSING_OPT", replacement: "NOOP", optional: true }
+		]);`,
+	})
+	if resOkMulti.Error != "" {
+		t.Fatalf("expected atomic multi-edit to succeed, got: %s", resOkMulti.Error)
+	}
+	if len(resOkMulti.Diffs) != 1 || strings.Count(resOkMulti.Diffs[0], "@@ -") != 2 {
+		t.Fatalf("expected 2 separate unified hunks in compact diff, got: %#v", resOkMulti.Diffs)
+	}
+}
+
 func TestSandboxGuards(t *testing.T) {
 	tmp := t.TempDir()
 

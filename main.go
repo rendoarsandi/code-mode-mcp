@@ -44,7 +44,12 @@ fs (workspace-jailed to cwd):
   fs.stat(path)                          -> { exists, path, isDir, size, lines? }
   fs.read(path, startLine?, endLine?)    -> string (1-indexed inclusive line slice)
   fs.grep(regex, globPattern?, maxHits?) -> [{ file, line, text }]
-  fs.edit(path, target, replacement)     -> { changed, occurrences, file, dryRun, diff }
+  fs.edit(path, target, replacement, opts?)
+                                         -> { changed, occurrences, file, dryRun, diff? }
+                                            Throws if target matches 0 times (unless opts.optional)
+                                            or >1 times (unless opts.replaceAll).
+  fs.edit(path, [{ target, replacement, optional?, replaceAll? }], opts?)
+                                         -> atomic multi-edit (validates all before writing)
   fs.write(path, content)                -> { written, dryRun, file, bytes }
 
 git:
@@ -70,7 +75,7 @@ func toolsList() []map[string]any {
 				"properties": map[string]any{
 					"code": map[string]any{
 						"type":        "string",
-						"description": "JavaScript source to execute. Available globals: print, console.log, fs.{glob,stat,read,grep,edit,write}, git.{status,diff}, sh.run.",
+						"description": "JavaScript source to execute. Globals: print, console.log, fs.{glob,stat,read,grep,edit,write}, git.{status,diff}, sh.run. Note: fs.edit(path, target, replacement, opts?) or fs.edit(path, [{target, replacement}], opts?) throws on 0 matches (unless {optional:true}) or >1 matches (unless {replaceAll:true}).",
 					},
 					"cwd": map[string]any{
 						"type":        "string",

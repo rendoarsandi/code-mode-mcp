@@ -11,7 +11,7 @@ Instead of making dozens of sequential tool calls (`read_file`, `grep`, `edit_fi
   - `fs.stat(path)`
   - `fs.read(path, startLine?, endLine?)`
   - `fs.grep(regex, globPattern?, maxHits?)`
-  - `fs.edit(path, target, replacement)` (exact-match + `diffMode: "stat" | "compact" | "full" | "none"` + `dryRun`)
+  - `fs.edit(path, target, replacement, opts?)` / `fs.edit(path, [{ target, replacement }], opts?)` (strict unique match by default; `{ optional: true }`, `{ replaceAll: true }`, atomic multi-edit, per-hunk Myers diff stats, `diffMode`, and `dryRun`)
   - `fs.write(path, content)` (`dryRun` + `diffMode` support)
   - `git.status()` / `git.diff(statOnly?)`
   - `sh.run(command)` (optional, can be disabled via `allowShell: false`)
