@@ -40,10 +40,12 @@ Globals:
   print(...args) / console.log(...args)  -> append to capped stdout
 
 fs (workspace-jailed to cwd):
-  fs.glob(pattern?, maxFiles?)           -> string[] (skips .git, node_modules, dist, build, etc.)
+  fs.glob(pattern?, maxFiles?)           -> string[] (supports ** and {a,b}; skips .git, node_modules, etc.)
   fs.stat(path)                          -> { exists, path, isDir, size, lines? }
   fs.read(path, startLine?, endLine?)    -> string (1-indexed inclusive line slice)
-  fs.grep(regex, globPattern?, maxHits?) -> [{ file, line, text }]
+  fs.readLines(path, startLine?, end?)   -> string (1-indexed numbered lines "  12: ...")
+  fs.readFn(path, symbol, maxLines?)     -> { found, file, symbol, startLine, endLine, text } (full fn/class ±2 lines)
+  fs.grep(regex, globPattern?, maxHits?) -> [{ file, line, text }] (accepts string or /RegExp/i; validates arg order)
   fs.edit(path, target, replacement, opts?)
                                          -> { changed, occurrences, file, dryRun, diff? }
                                             Throws if target matches 0 times (unless opts.optional)
@@ -61,7 +63,7 @@ sh (when allowShell !== false):
 
 Notes:
   - Set dryRun: true to preview fs.edit / fs.write diffs without modifying disk.
-  - diffMode: "stat" (default for writes), "compact" (default for dryRun), "full", or "none" to keep multi-edit responses inline.
+  - diffMode: "auto" (default: compact ±3-line unified diff for small edits within inline budget, auto-falling back to stat), "stat", "compact", "full", or "none".
   - Set allowShell: false for pure read/edit sandboxing with zero shell execution.
   - Timeout defaults to 15000ms (max 120000ms); stdout defaults to 7500 bytes (max 65536) to stay inline without spillover.`
 
@@ -75,7 +77,7 @@ func toolsList() []map[string]any {
 				"properties": map[string]any{
 					"code": map[string]any{
 						"type":        "string",
-						"description": "JavaScript source to execute. Globals: print, console.log, fs.{glob,stat,read,grep,edit,write}, git.{status,diff}, sh.run. Note: fs.edit(path, target, replacement, opts?) or fs.edit(path, [{target, replacement}], opts?) throws on 0 matches (unless {optional:true}) or >1 matches (unless {replaceAll:true}).",
+						"description": "JavaScript source to execute. Globals: print, console.log, fs.{glob,stat,read,readLines,readFn,grep,edit,write}, git.{status,diff}, sh.run. Signatures: fs.grep(regexOrRegExp, globPattern?, maxHits?), fs.readFn(path, symbol), fs.edit(path, target, replacement, opts?) or fs.edit(path, [{target, replacement}], opts?).",
 					},
 					"cwd": map[string]any{
 						"type":        "string",
@@ -87,8 +89,8 @@ func toolsList() []map[string]any {
 					},
 					"diffMode": map[string]any{
 						"type":        "string",
-						"enum":        []string{"stat", "compact", "full", "none"},
-						"description": "Controls diff verbosity in the response: 'stat' (default for writes, one-line +/- summary), 'compact' (default for dryRun, up to 12 changed lines), 'full' (up to 60 changed lines), or 'none' (omit diffs).",
+						"enum":        []string{"auto", "stat", "compact", "full", "none"},
+						"description": "Controls diff verbosity: 'auto' (default: compact ±3-line unified diff for small edits within inline budget, falling back to stat), 'stat' (one-line +/- summary), 'compact' (up to 20 changed lines ±3 ctx), 'full' (up to 60 changed lines), or 'none'.",
 					},
 					"allowShell": map[string]any{
 						"type":        "boolean",

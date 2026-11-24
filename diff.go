@@ -192,8 +192,8 @@ func makeSimpleDiff(path, oldText, newText string, maxDiffLines int) string {
 	}
 	ops := myersLineDiff(strings.Split(oldText, "\n"), strings.Split(newText, "\n"))
 
-	// Identify non-equal ranges and group hunks separated by <= 4 equal lines.
-	const ctxLines = 2
+	// Identify non-equal ranges and group hunks separated by <= 6 equal lines.
+	const ctxLines = 3
 	type hunkRange struct{ start, end int }
 	var hunks []hunkRange
 	for i, op := range ops {

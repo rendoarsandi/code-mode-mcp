@@ -46,7 +46,7 @@ func TestCodeExecGlobGrepReadEditAndDryRun(t *testing.T) {
 		t.Fatalf("dryRun modified disk!")
 	}
 
-	// 2. Real edit (defaults to diffMode="stat")
+	// 2. Real edit (defaults to diffMode="auto" -> compact ±3-line unified diff for small edits!)
 	res2 := runCodeExec(ExecRequest{
 		Cwd:  tmp,
 		Code: `fs.edit("src/app.js", "const a = 1;", "const a = 99;");`,
@@ -54,19 +54,29 @@ func TestCodeExecGlobGrepReadEditAndDryRun(t *testing.T) {
 	if res2.Error != "" {
 		t.Fatalf("unexpected error: %s", res2.Error)
 	}
-	if len(res2.Diffs) != 1 || !strings.Contains(res2.Diffs[0], "src/app.js (+1/-1 lines)") {
-		t.Fatalf("expected stat diff by default, got: %#v", res2.Diffs)
+	if len(res2.Diffs) != 1 || !strings.Contains(res2.Diffs[0], "+const a = 99;") || !strings.Contains(res2.Diffs[0], " // TODO fix bug") {
+		t.Fatalf("expected auto compact diff with surrounding context, got: %#v", res2.Diffs)
 	}
 	disk2, _ := os.ReadFile(filepath.Join(tmp, "src", "app.js"))
 	if !strings.Contains(string(disk2), "const a = 99;") {
 		t.Fatalf("real edit did not persist: %s", string(disk2))
 	}
 
-	// 3. diffMode="none" omits diffs
+	// 3. Explicit diffMode="stat" returns one-line summary
+	resStat := runCodeExec(ExecRequest{
+		Cwd:      tmp,
+		DiffMode: "stat",
+		Code:     `fs.edit("src/app.js", "const a = 99;", "const a = 98;");`,
+	})
+	if resStat.Error != "" || len(resStat.Diffs) != 1 || resStat.Diffs[0] != "src/app.js (+1/-1 lines)" {
+		t.Fatalf("expected stat diff, got err=%q diffs=%#v", resStat.Error, resStat.Diffs)
+	}
+
+	// 4. diffMode="none" omits diffs
 	res3 := runCodeExec(ExecRequest{
 		Cwd:      tmp,
 		DiffMode: "none",
-		Code:     `fs.edit("src/app.js", "const a = 99;", "const a = 100;");`,
+		Code:     `fs.edit("src/app.js", "const a = 98;", "const a = 100;");`,
 	})
 	if res3.Error != "" || len(res3.Diffs) != 0 {
 		t.Fatalf("expected no diffs with diffMode=none, got err=%q diffs=%#v", res3.Error, res3.Diffs)
@@ -120,8 +130,9 @@ func TestEditStrictnessMultiEditAndPerHunkDiff(t *testing.T) {
 
 	// 4. Ambiguous succeeds with { replaceAll: true } AND reports exact per-hunk (+2/-2 lines), NOT (+151/-151)!
 	resAll := runCodeExec(ExecRequest{
-		Cwd:  tmp,
-		Code: `fs.edit("big.js", "if (flag) run();", "if (flag) runFast();", { replaceAll: true });`,
+		Cwd:      tmp,
+		DiffMode: "stat",
+		Code:     `fs.edit("big.js", "if (flag) run();", "if (flag) runFast();", { replaceAll: true });`,
 	})
 	if resAll.Error != "" {
 		t.Fatalf("expected replaceAll to succeed, got: %s", resAll.Error)
@@ -161,6 +172,85 @@ func TestEditStrictnessMultiEditAndPerHunkDiff(t *testing.T) {
 	}
 	if len(resOkMulti.Diffs) != 1 || strings.Count(resOkMulti.Diffs[0], "@@ -") != 2 {
 		t.Fatalf("expected 2 separate unified hunks in compact diff, got: %#v", resOkMulti.Diffs)
+	}
+}
+
+func TestGrepValidationAndReadFn(t *testing.T) {
+	tmp := t.TempDir()
+	js := `// header
+function syncCoopLobby(lobby, myPeerId) {
+  const isHost = lobby.hostId === myPeerId;
+  if (isHost) {
+    return "HOST";
+  }
+  return "GUEST";
+}
+// footer
+`
+	py := `def helper(x):
+    if x > 0:
+        return x * 2
+    return 0
+
+def next_fn():
+    pass
+`
+	_ = os.WriteFile(filepath.Join(tmp, "ui.js"), []byte(js), 0644)
+	_ = os.WriteFile(filepath.Join(tmp, "util.py"), []byte(py), 0644)
+
+	// 1. fs.grep accepts JS RegExp literals with /i flag
+	resRe := runCodeExec(ExecRequest{
+		Cwd:  tmp,
+		Code: `fs.grep(/ishost/i, "**/*.js");`,
+	})
+	if resRe.Error != "" {
+		t.Fatalf("expected RegExp grep to work, got: %s", resRe.Error)
+	}
+	raw, _ := json.Marshal(resRe.Result)
+	if !strings.Contains(string(raw), `"line":3`) || !strings.Contains(string(raw), `"line":4`) {
+		t.Fatalf("expected case-insensitive hits on lines 3 & 4, got: %s", string(raw))
+	}
+
+	// 2. fs.grep detects swapped (filePath, regex) arguments and throws a helpful error
+	resSwap := runCodeExec(ExecRequest{
+		Cwd:  tmp,
+		Code: `fs.grep("ui.js", "isHost");`,
+	})
+	if !strings.Contains(resSwap.Error, "arguments look swapped") {
+		t.Fatalf("expected swapped-arg error, got: %+v", resSwap)
+	}
+
+	// 3. fs.grep rejects non-string/non-RegExp first argument
+	resBad := runCodeExec(ExecRequest{
+		Cwd:  tmp,
+		Code: `fs.grep(123, "*.js");`,
+	})
+	if !strings.Contains(resBad.Error, "must be a string or RegExp") {
+		t.Fatalf("expected type error on numeric regex, got: %+v", resBad)
+	}
+
+	// 4. fs.readFn extracts full JS function with line numbers
+	resFn := runCodeExec(ExecRequest{
+		Cwd:  tmp,
+		Code: `var r = fs.readFn("ui.js", "syncCoopLobby"); print(r.text); r;`,
+	})
+	if resFn.Error != "" {
+		t.Fatalf("readFn JS failed: %s", resFn.Error)
+	}
+	if !strings.Contains(resFn.Stdout, "   2: function syncCoopLobby") || !strings.Contains(resFn.Stdout, "   8: }") {
+		t.Fatalf("expected full JS function body, got:\n%s", resFn.Stdout)
+	}
+
+	// 5. fs.readFn extracts full Python function
+	resPy := runCodeExec(ExecRequest{
+		Cwd:  tmp,
+		Code: `var r = fs.readFn("util.py", "helper"); print(r.text); r;`,
+	})
+	if resPy.Error != "" {
+		t.Fatalf("readFn Python failed: %s", resPy.Error)
+	}
+	if !strings.Contains(resPy.Stdout, "   1: def helper(x):") || !strings.Contains(resPy.Stdout, "   4:     return 0") {
+		t.Fatalf("expected full Python function body, got:\n%s", resPy.Stdout)
 	}
 }
 

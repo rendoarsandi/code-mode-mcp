@@ -94,6 +94,7 @@ type sandbox struct {
 	root       string
 	dryRun     bool
 	diffMode   string
+	diffBytes  int
 	allowShell bool
 	timeout    time.Duration
 	out        *boundedBuffer
@@ -105,13 +106,13 @@ type sandbox struct {
 
 func normalizeDiffMode(raw string, dryRun bool) string {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "none", "stat", "compact", "full":
+	case "none", "stat", "compact", "full", "auto":
 		return strings.ToLower(strings.TrimSpace(raw))
 	default:
 		if dryRun {
 			return "compact"
 		}
-		return "stat"
+		return "auto"
 	}
 }
 
@@ -122,9 +123,21 @@ func (s *sandbox) formatDiff(rel, oldText, newText string) string {
 	case "stat":
 		return makeDiffStat(rel, oldText, newText)
 	case "compact":
-		return makeSimpleDiff(rel, oldText, newText, 12)
-	default: // "full"
+		return makeSimpleDiff(rel, oldText, newText, 20)
+	case "full":
 		return makeSimpleDiff(rel, oldText, newText, 60)
+	default: // "auto": compact ±3-line diff for small edits while within inline budget, else stat
+		added, removed := diffStats(oldText, newText)
+		if added+removed <= 25 && s.diffBytes < 2600 {
+			d := makeSimpleDiff(rel, oldText, newText, 20)
+			if s.diffBytes+len(d) <= 3200 {
+				s.diffBytes += len(d)
+				return d
+			}
+		}
+		st := makeDiffStat(rel, oldText, newText)
+		s.diffBytes += len(st)
+		return st
 	}
 }
 
@@ -448,20 +461,114 @@ func runCodeExec(req ExecRequest) ExecResult {
 			}
 			return vm.ToValue(strings.Join(lines[startLine-1:endLine], "\n"))
 		},
-		"grep": func(call goja.FunctionCall) goja.Value {
+		"readLines": func(call goja.FunctionCall) goja.Value {
 			if len(call.Arguments) < 1 {
-				panic(vm.NewTypeError("fs.grep(regex, globPattern?, maxHits?) requires regex"))
+				panic(vm.NewTypeError("fs.readLines(path, startLine?, endLine?) requires path"))
 			}
-			re, err := regexp.Compile(call.Arguments[0].String())
+			abs, _, err := sb.resolvePath(call.Arguments[0].String())
 			if err != nil {
-				panic(vm.NewGoError(fmt.Errorf("invalid regex: %w", err)))
+				panic(vm.NewGoError(err))
 			}
+			data, err := os.ReadFile(abs)
+			if err != nil {
+				panic(vm.NewGoError(err))
+			}
+			lines := strings.Split(string(data), "\n")
+			startLine := 1
+			if len(call.Arguments) >= 2 && !goja.IsUndefined(call.Arguments[1]) {
+				startLine = int(call.Arguments[1].ToInteger())
+			}
+			endLine := len(lines)
+			if len(call.Arguments) >= 3 && !goja.IsUndefined(call.Arguments[2]) {
+				endLine = int(call.Arguments[2].ToInteger())
+			}
+			if startLine < 1 {
+				startLine = 1
+			}
+			if endLine > len(lines) {
+				endLine = len(lines)
+			}
+			if startLine > endLine {
+				return vm.ToValue("")
+			}
+			return vm.ToValue(formatNumberedLines(lines[startLine-1:endLine], startLine))
+		},
+		"readFn": func(call goja.FunctionCall) goja.Value {
+			if len(call.Arguments) < 2 {
+				panic(vm.NewTypeError("fs.readFn(path, symbol, maxLines?) requires path and symbol"))
+			}
+			abs, rel, err := sb.resolvePath(call.Arguments[0].String())
+			if err != nil {
+				panic(vm.NewGoError(err))
+			}
+			symbol := strings.TrimSpace(call.Arguments[1].String())
+			if symbol == "" {
+				panic(vm.NewTypeError("fs.readFn symbol cannot be empty"))
+			}
+			maxLines := 200
+			if len(call.Arguments) >= 3 && !goja.IsUndefined(call.Arguments[2]) {
+				if n := int(call.Arguments[2].ToInteger()); n > 0 {
+					maxLines = n
+				}
+			}
+			data, err := os.ReadFile(abs)
+			if err != nil {
+				panic(vm.NewGoError(err))
+			}
+			return vm.ToValue(extractFunction(rel, string(data), symbol, maxLines))
+		},
+		"grep": func(call goja.FunctionCall) goja.Value {
+			if len(call.Arguments) < 1 || goja.IsUndefined(call.Arguments[0]) || goja.IsNull(call.Arguments[0]) {
+				panic(vm.NewTypeError("fs.grep(regex, globPattern?, maxHits?) requires a string or RegExp as argument 1"))
+			}
+			var rawPattern string
+			arg0 := call.Arguments[0]
+			if obj, ok := arg0.(*goja.Object); ok {
+				if obj.ClassName() == "RegExp" {
+					src := obj.Get("source").String()
+					flags := ""
+					if fv := obj.Get("flags"); fv != nil && !goja.IsUndefined(fv) {
+						flags = fv.String()
+					}
+					prefix := ""
+					if strings.Contains(flags, "i") {
+						prefix += "i"
+					}
+					if strings.Contains(flags, "m") {
+						prefix += "m"
+					}
+					if prefix != "" {
+						rawPattern = "(?" + prefix + ")" + src
+					} else {
+						rawPattern = src
+					}
+				} else {
+					panic(vm.NewTypeError("fs.grep(regex, globPattern?, maxHits?): first argument must be a string or RegExp"))
+				}
+			} else if _, ok := arg0.Export().(string); ok {
+				rawPattern = arg0.String()
+			} else {
+				panic(vm.NewTypeError("fs.grep(regex, globPattern?, maxHits?): first argument must be a string or RegExp"))
+			}
+
+			re, err := regexp.Compile(rawPattern)
+			if err != nil {
+				panic(vm.NewGoError(fmt.Errorf("fs.grep invalid regex %q: %w", rawPattern, err)))
+			}
+
 			globPat := "**/*"
-			if len(call.Arguments) >= 2 && !goja.IsUndefined(call.Arguments[1]) && call.Arguments[1].String() != "" {
-				globPat = call.Arguments[1].String()
+			hasGlobArg := false
+			if len(call.Arguments) >= 2 && !goja.IsUndefined(call.Arguments[1]) && !goja.IsNull(call.Arguments[1]) {
+				if _, ok := call.Arguments[1].Export().(string); !ok {
+					panic(vm.NewTypeError("fs.grep(regex, globPattern?, maxHits?): second argument globPattern must be a string"))
+				}
+				if s := call.Arguments[1].String(); s != "" {
+					globPat = s
+					hasGlobArg = true
+				}
 			}
 			maxHits := 200
-			if len(call.Arguments) >= 3 && !goja.IsUndefined(call.Arguments[2]) {
+			if len(call.Arguments) >= 3 && !goja.IsUndefined(call.Arguments[2]) && !goja.IsNull(call.Arguments[2]) {
 				if n := int(call.Arguments[2].ToInteger()); n > 0 {
 					maxHits = n
 				}
@@ -469,6 +576,14 @@ func runCodeExec(req ExecRequest) ExecResult {
 			files, err := sb.walkFiles(globPat, 2000)
 			if err != nil {
 				panic(vm.NewGoError(err))
+			}
+			// Catch swapped (filePath, regex) arguments instead of silently returning [].
+			if hasGlobArg && len(files) == 0 {
+				if abs0, _, rerr := sb.resolvePath(rawPattern); rerr == nil {
+					if _, serr := os.Stat(abs0); serr == nil {
+						panic(vm.NewTypeError(fmt.Sprintf("fs.grep: globPattern %q matched 0 files, while first arg %q is an existing path — arguments look swapped; signature is fs.grep(regex, globPattern?, maxHits?)", globPat, rawPattern)))
+					}
+				}
 			}
 			type hit struct {
 				File string `json:"file"`
