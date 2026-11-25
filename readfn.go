@@ -2,6 +2,9 @@ package main
 
 import (
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -12,6 +15,7 @@ type readFnResult struct {
 	Found       bool     `json:"found"`
 	File        string   `json:"file"`
 	Symbol      string   `json:"symbol"`
+	Receiver    string   `json:"receiver,omitempty"`
 	StartLine   int      `json:"startLine,omitempty"`
 	EndLine     int      `json:"endLine,omitempty"`
 	Truncated   bool     `json:"truncated,omitempty"`
@@ -21,10 +25,11 @@ type readFnResult struct {
 }
 
 type symbolInfo struct {
-	Name    string `json:"name"`
-	Kind    string `json:"kind"`
-	Line    int    `json:"line"`
-	EndLine int    `json:"endLine"`
+	Name     string `json:"name"`
+	Kind     string `json:"kind"`
+	Receiver string `json:"receiver,omitempty"`
+	Line     int    `json:"line"`
+	EndLine  int    `json:"endLine"`
 }
 
 type symbolSpec struct {
@@ -41,15 +46,17 @@ var symbolExtractors = []symbolSpec{
 	{regexp.MustCompile(`^\s*type\s+([A-Za-z_]\w*)(?:\[[^\]]*\])?\s+(?:struct|interface)\b`), "type"},
 	{regexp.MustCompile(`^\s*(?:export\s+)?interface\s+([A-Za-z_$][\w$]*)`), "interface"},
 	{regexp.MustCompile(`^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+([A-Za-z_]\w*)(?:<[^>]*>)?\s*\(`), "fn"},
+	{regexp.MustCompile(`^\s*export\s+(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=`), "const"},
 	{regexp.MustCompile(`^\s*(?:(?:public|private|protected|static|readonly|override|abstract|async|get|set)\s+)*([A-Za-z_$][\w$]*)(?:<[^>]*>)?\s*\([^)]*\)\s*(?::\s*[^={;]+)?\{`), "method"},
 	{regexp.MustCompile(`^\s*([A-Za-z_$][\w$]*)\s*:\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*(?::\s*[^=]+)?=>)`), "method"},
 }
 
 // multilineMethodStart catches method declarations whose parameter list spans multiple lines, e.g.:
-//   public async buildMesh(
-//     cx: number,
-//     cz: number,
-//   ): Promise<void> {
+//
+//	public async buildMesh(
+//	  cx: number,
+//	  cz: number,
+//	): Promise<void> {
 var multilineMethodStart = regexp.MustCompile(`^\s*(?:(?:public|private|protected|static|readonly|override|abstract|async|get|set)\s+)*([A-Za-z_$][\w$]*)(?:<[^>]*>)?\s*\([^)]*$`)
 
 var ignoredControlKeywords = map[string]bool{
@@ -521,12 +528,145 @@ func buildFnResult(rel, symbol string, lines []string, defIdx, endIdx, maxLines 
 
 // extractSymbols returns all top-level and nested symbol declarations with 1-based line ranges,
 // skipping matches inside multi-line block comments and template/raw strings.
+func formatGoReceiverType(expr ast.Expr) string {
+	switch e := expr.(type) {
+	case *ast.StarExpr:
+		return "*" + formatGoReceiverType(e.X)
+	case *ast.Ident:
+		return e.Name
+	case *ast.IndexExpr:
+		return formatGoReceiverType(e.X) + "[" + formatGoReceiverType(e.Index) + "]"
+	case *ast.IndexListExpr:
+		parts := make([]string, len(e.Indices))
+		for i, idx := range e.Indices {
+			parts[i] = formatGoReceiverType(idx)
+		}
+		return formatGoReceiverType(e.X) + "[" + strings.Join(parts, ", ") + "]"
+	case *ast.SelectorExpr:
+		return formatGoReceiverType(e.X) + "." + e.Sel.Name
+	default:
+		return ""
+	}
+}
+
+func extractGoSymbolsAST(rel, src string) ([]symbolInfo, bool) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, rel, src, parser.SkipObjectResolution)
+	if err != nil || file == nil {
+		return nil, false
+	}
+	var out []symbolInfo
+	for _, decl := range file.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			if d.Name == nil {
+				continue
+			}
+			kind := "func"
+			recv := ""
+			if d.Recv != nil && len(d.Recv.List) > 0 {
+				kind = "method"
+				recv = formatGoReceiverType(d.Recv.List[0].Type)
+			}
+			startLine := fset.Position(d.Pos()).Line
+			endLine := fset.Position(d.End()).Line
+			if endLine < startLine {
+				endLine = startLine
+			}
+			out = append(out, symbolInfo{
+				Name:     d.Name.Name,
+				Kind:     kind,
+				Receiver: recv,
+				Line:     startLine,
+				EndLine:  endLine,
+			})
+		case *ast.GenDecl:
+			switch d.Tok {
+			case token.TYPE:
+				for _, sp := range d.Specs {
+					ts, ok := sp.(*ast.TypeSpec)
+					if !ok || ts.Name == nil || ts.Name.Name == "_" {
+						continue
+					}
+					startLine := fset.Position(ts.Pos()).Line
+					endLine := fset.Position(ts.End()).Line
+					if endLine < startLine {
+						endLine = startLine
+					}
+					out = append(out, symbolInfo{
+						Name:    ts.Name.Name,
+						Kind:    "type",
+						Line:    startLine,
+						EndLine: endLine,
+					})
+				}
+			case token.CONST, token.VAR:
+				kind := "const"
+				if d.Tok == token.VAR {
+					kind = "var"
+				}
+				for _, sp := range d.Specs {
+					vs, ok := sp.(*ast.ValueSpec)
+					if !ok {
+						continue
+					}
+					startLine := fset.Position(vs.Pos()).Line
+					endLine := fset.Position(vs.End()).Line
+					if endLine < startLine {
+						endLine = startLine
+					}
+					for _, id := range vs.Names {
+						if id == nil || id.Name == "_" {
+							continue
+						}
+						out = append(out, symbolInfo{
+							Name:    id.Name,
+							Kind:    kind,
+							Line:    startLine,
+							EndLine: endLine,
+						})
+					}
+				}
+			}
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Line != out[j].Line {
+			return out[i].Line < out[j].Line
+		}
+		return out[i].EndLine < out[j].EndLine
+	})
+	return out, true
+}
+
+func matchesSymbolQuery(sym symbolInfo, query string) bool {
+	if sym.Name == query {
+		return true
+	}
+	if sym.Receiver == "" {
+		return false
+	}
+	if "("+sym.Receiver+")."+sym.Name == query || sym.Receiver+"."+sym.Name == query {
+		return true
+	}
+	bare := strings.TrimPrefix(sym.Receiver, "*")
+	if idx := strings.IndexByte(bare, '['); idx >= 0 {
+		bare = bare[:idx]
+	}
+	return bare+"."+sym.Name == query || "(*"+bare+")."+sym.Name == query
+}
+
 func extractSymbols(rel, text string) []symbolInfo {
 	lines := strings.Split(text, "\n")
 	return extractSymbolsFromLines(rel, lines)
 }
 
 func extractSymbolsFromLines(rel string, lines []string) []symbolInfo {
+	if strings.EqualFold(filepath.Ext(rel), ".go") {
+		if syms, ok := extractGoSymbolsAST(rel, strings.Join(lines, "\n")); ok {
+			return syms
+		}
+	}
 	isPy := strings.EqualFold(filepath.Ext(rel), ".py")
 	st := newBraceScanState(rel)
 	var out []symbolInfo
@@ -602,7 +742,9 @@ func extractFunctionAtWithSymbols(rel string, lines []string, syms []symbolInfo,
 	}
 	if bestIdx >= 0 {
 		best := syms[bestIdx]
-		return buildFnResult(rel, best.Name, lines, best.Line-1, best.EndLine-1, maxLines, nil)
+		res := buildFnResult(rel, best.Name, lines, best.Line-1, best.EndLine-1, maxLines, nil)
+		res.Receiver = best.Receiver
+		return res
 	}
 
 	// Fallback for top-level code: return ±15 numbered lines around lineNum with Found: false.
@@ -633,7 +775,7 @@ func extractFunction(rel, text, symbol string, maxLines int) readFnResult {
 	var matchedSyms []symbolInfo
 	var matchLines []int
 	for _, sym := range syms {
-		if sym.Name == symbol {
+		if matchesSymbolQuery(sym, symbol) {
 			matchedSyms = append(matchedSyms, sym)
 			matchLines = append(matchLines, sym.Line)
 		}
@@ -658,5 +800,7 @@ func extractFunction(rel, text, symbol string, maxLines int) readFnResult {
 		}
 	}
 
-	return buildFnResult(rel, symbol, lines, chosen.Line-1, chosen.EndLine-1, maxLines, matchLines)
+	res := buildFnResult(rel, chosen.Name, lines, chosen.Line-1, chosen.EndLine-1, maxLines, matchLines)
+	res.Receiver = chosen.Receiver
+	return res
 }

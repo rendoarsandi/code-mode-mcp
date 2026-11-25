@@ -10,8 +10,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -20,7 +22,7 @@ import (
 
 const (
 	defaultReadTimeoutMs = 15000
-	defaultExecTimeoutMs = 45000
+	defaultExecTimeoutMs = 90000
 	maxTimeoutMs         = 300000
 	defaultMaxOutByte    = 9200
 	maxOutByteLimit      = 65536
@@ -44,7 +46,7 @@ var defaultSkipDirs = map[string]bool{
 	".cache":       true,
 }
 
-var defaultCheckFailRe = regexp.MustCompile(`(?i)(FAIL|ERROR|ERR!|Exception|AssertionError|ReferenceError|TypeError|SyntaxError|panic:|--- FAIL|✗|✘)`)
+var defaultCheckFailRe = regexp.MustCompile(`(?i)(FAIL|ERROR|ERR!|Exception|AssertionError|ReferenceError|TypeError|SyntaxError|panic:|--- FAIL|✗|✘|✖)`)
 
 type ExecRequest struct {
 	Code         string `json:"code"`
@@ -811,6 +813,157 @@ func serveCachedOutput(req ExecRequest, maxOut int, start time.Time) ExecResult 
 	}
 }
 
+type searchCallOpts struct {
+	globPat     string
+	hasGlobArg  bool
+	maxCount    int
+	maxLines    int
+	includeText bool
+	ignore      []string
+}
+
+func parseSearchCallOpts(vm *goja.Runtime, args []goja.Value, sig string, defaultMax int, maxKeys ...string) searchCallOpts {
+	res := searchCallOpts{
+		globPat:  "**/*",
+		maxCount: defaultMax,
+		maxLines: 200,
+	}
+	applyObj := func(obj *goja.Object) {
+		if gv := obj.Get("glob"); gv != nil && !goja.IsUndefined(gv) && !goja.IsNull(gv) {
+			if s, ok := gv.Export().(string); ok && s != "" {
+				res.globPat = s
+				res.hasGlobArg = true
+			}
+		} else if pv := obj.Get("pattern"); pv != nil && !goja.IsUndefined(pv) && !goja.IsNull(pv) {
+			if s, ok := pv.Export().(string); ok && s != "" {
+				res.globPat = s
+				res.hasGlobArg = true
+			}
+		}
+		for _, k := range maxKeys {
+			if mv := obj.Get(k); mv != nil && !goja.IsUndefined(mv) && !goja.IsNull(mv) {
+				if n := int(mv.ToInteger()); n > 0 {
+					res.maxCount = n
+					break
+				}
+			}
+		}
+		if ml := obj.Get("maxLines"); ml != nil && !goja.IsUndefined(ml) && !goja.IsNull(ml) {
+			if n := int(ml.ToInteger()); n > 0 {
+				res.maxLines = n
+			}
+		}
+		if it := obj.Get("includeText"); it != nil && !goja.IsUndefined(it) && !goja.IsNull(it) {
+			res.includeText = it.ToBoolean()
+		}
+		if ig := obj.Get("ignore"); ig != nil && !goja.IsUndefined(ig) && !goja.IsNull(ig) {
+			res.ignore = extractStringSlice(vm, ig)
+		}
+	}
+
+	if len(args) >= 2 && !goja.IsUndefined(args[1]) && !goja.IsNull(args[1]) {
+		arg1 := args[1]
+		switch exp := arg1.Export().(type) {
+		case string:
+			if exp != "" {
+				res.globPat = exp
+				res.hasGlobArg = true
+			}
+		case int64, float64, int:
+			if n := int(arg1.ToInteger()); n > 0 {
+				res.maxCount = n
+			}
+		default:
+			if obj, ok := arg1.(*goja.Object); ok && obj.ClassName() != "RegExp" {
+				applyObj(obj)
+			} else {
+				panic(vm.NewTypeError(sig + ": second argument must be a glob string, options object, or max count"))
+			}
+		}
+	}
+	if len(args) >= 3 && !goja.IsUndefined(args[2]) && !goja.IsNull(args[2]) {
+		arg2 := args[2]
+		if obj, ok := arg2.(*goja.Object); ok {
+			applyObj(obj)
+		} else if n := int(arg2.ToInteger()); n > 0 {
+			res.maxCount = n
+		}
+	}
+	return res
+}
+
+func (sb *sandbox) scanFilesParallel(files []string, fn func(idx int, rel string, data []byte)) int {
+	n := len(files)
+	if n == 0 {
+		return 0
+	}
+	var skippedLarge atomic.Int64
+	process := func(idx int) {
+		if sb.ctx.Err() != nil {
+			return
+		}
+		rel := files[idx]
+		abs := filepath.Join(sb.root, filepath.FromSlash(rel))
+		info, err := os.Stat(abs)
+		if err != nil || info.IsDir() {
+			return
+		}
+		if info.Size() > 2*1024*1024 {
+			skippedLarge.Add(1)
+			return
+		}
+		data, err := sb.readFileBytes(abs)
+		if err != nil || bytes.IndexByte(data, 0) != -1 {
+			return
+		}
+		fn(idx, rel, data)
+	}
+
+	if n <= 4 {
+		for i := 0; i < n; i++ {
+			process(i)
+		}
+		return int(skippedLarge.Load())
+	}
+
+	workers := runtime.NumCPU()
+	if workers < 2 {
+		workers = 2
+	}
+	if workers > 8 {
+		workers = 8
+	}
+	if workers > n {
+		workers = n
+	}
+
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(next.Add(1) - 1)
+				if i >= n || sb.ctx.Err() != nil {
+					return
+				}
+				process(i)
+			}
+		}()
+	}
+	wg.Wait()
+	return int(skippedLarge.Load())
+}
+
+func extractBaseSymbolName(query string) string {
+	s := strings.TrimSpace(query)
+	if idx := strings.LastIndexByte(s, '.'); idx >= 0 && idx+1 < len(s) {
+		s = s[idx+1:]
+	}
+	return strings.TrimSpace(s)
+}
+
 func runCodeExec(req ExecRequest) ExecResult {
 	start := time.Now()
 	maxOut := req.MaxOutByte
@@ -1071,12 +1224,16 @@ func runCodeExec(req ExecRequest) ExecResult {
 			syms := extractSymbols(rel, string(data))
 			out := make([]map[string]any, len(syms))
 			for i, sym := range syms {
-				out[i] = map[string]any{
+				entry := map[string]any{
 					"name":    sym.Name,
 					"kind":    sym.Kind,
 					"line":    sym.Line,
 					"endLine": sym.EndLine,
 				}
+				if sym.Receiver != "" {
+					entry["receiver"] = sym.Receiver
+				}
+				out[i] = entry
 			}
 			return vm.ToValue(out)
 		},
@@ -1129,46 +1286,22 @@ func runCodeExec(req ExecRequest) ExecResult {
 			return vm.ToValue(extractFunctionAt(rel, string(data), lineNum, maxLines))
 		},
 		"grep": func(call goja.FunctionCall) goja.Value {
+			const sig = "fs.grep(regex, globOrOpts?, optsOrMaxHits?)"
 			if len(call.Arguments) < 1 {
-				panic(vm.NewTypeError("fs.grep(regex, globPattern?, optsOrMaxHits?) requires a string or RegExp as argument 1"))
+				panic(vm.NewTypeError(sig + " requires a string or RegExp as argument 1"))
 			}
-			rawPattern, re := parseRegexArg(vm, call.Arguments[0], "fs.grep(regex, globPattern?, optsOrMaxHits?)")
+			rawPattern, re := parseRegexArg(vm, call.Arguments[0], sig)
+			opts := parseSearchCallOpts(vm, call.Arguments, sig, 200, "maxHits", "max")
 
-			globPat := "**/*"
-			hasGlobArg := false
-			if len(call.Arguments) >= 2 && !goja.IsUndefined(call.Arguments[1]) && !goja.IsNull(call.Arguments[1]) {
-				if _, ok := call.Arguments[1].Export().(string); !ok {
-					panic(vm.NewTypeError("fs.grep(regex, globPattern?, optsOrMaxHits?): second argument globPattern must be a string"))
-				}
-				if s := call.Arguments[1].String(); s != "" {
-					globPat = s
-					hasGlobArg = true
-				}
-			}
-			maxHits := 200
-			var ignore []string
-			if len(call.Arguments) >= 3 && !goja.IsUndefined(call.Arguments[2]) && !goja.IsNull(call.Arguments[2]) {
-				arg2 := call.Arguments[2]
-				if obj, ok := arg2.(*goja.Object); ok {
-					if mv := obj.Get("maxHits"); mv != nil && !goja.IsUndefined(mv) && !goja.IsNull(mv) {
-						if n := int(mv.ToInteger()); n > 0 {
-							maxHits = n
-						}
-					}
-					ignore = extractStringSlice(vm, obj.Get("ignore"))
-				} else if n := int(arg2.ToInteger()); n > 0 {
-					maxHits = n
-				}
-			}
-			files, _, err := sb.walkFiles(globPat, 2000, ignore)
+			files, _, err := sb.walkFiles(opts.globPat, 2000, opts.ignore)
 			if err != nil {
 				panic(vm.NewGoError(err))
 			}
 			// Catch swapped (filePath, regex) arguments instead of silently returning [].
-			if hasGlobArg && len(files) == 0 {
+			if opts.hasGlobArg && len(files) == 0 {
 				if abs0, _, rerr := sb.resolvePath(rawPattern); rerr == nil {
 					if _, serr := os.Stat(abs0); serr == nil {
-						panic(vm.NewTypeError(fmt.Sprintf("fs.grep: globPattern %q matched 0 files, while first arg %q is an existing path — arguments look swapped; signature is fs.grep(regex, globPattern?, optsOrMaxHits?)", globPat, rawPattern)))
+						panic(vm.NewTypeError(fmt.Sprintf("fs.grep: globPattern %q matched 0 files, while first arg %q is an existing path — arguments look swapped; signature is %s", opts.globPat, rawPattern, sig)))
 					}
 				}
 			}
@@ -1177,39 +1310,33 @@ func runCodeExec(req ExecRequest) ExecResult {
 				Line int    `json:"line"`
 				Text string `json:"text"`
 			}
-			hits := make([]hit, 0, 32)
-			truncated := false
-			skippedLarge := 0
-			for _, rel := range files {
-				if sb.ctx.Err() != nil {
-					break
-				}
-				abs := filepath.Join(sb.root, filepath.FromSlash(rel))
-				info, err := os.Stat(abs)
-				if err != nil || info.IsDir() {
-					continue
-				}
-				if info.Size() > 2*1024*1024 {
-					skippedLarge++
-					continue
-				}
-				data, err := sb.readFileBytes(abs)
-				if err != nil || bytes.IndexByte(data, 0) != -1 {
-					continue // skip binary files
-				}
+			perFile := make([][]hit, len(files))
+			skippedLarge := sb.scanFilesParallel(files, func(idx int, rel string, data []byte) {
 				lines := strings.Split(string(data), "\n")
-				for idx, line := range lines {
+				var local []hit
+				for li, line := range lines {
 					if re.MatchString(line) {
-						if len(hits) >= maxHits {
-							truncated = true
-							break
-						}
 						trimmed := strings.TrimSpace(line)
 						if len(trimmed) > 200 {
 							trimmed = trimmed[:200] + "..."
 						}
-						hits = append(hits, hit{File: rel, Line: idx + 1, Text: trimmed})
+						local = append(local, hit{File: rel, Line: li + 1, Text: trimmed})
+						if len(local) >= opts.maxCount+1 {
+							break
+						}
 					}
+				}
+				perFile[idx] = local
+			})
+			hits := make([]hit, 0, 32)
+			truncated := false
+			for _, fh := range perFile {
+				for _, h := range fh {
+					if len(hits) >= opts.maxCount {
+						truncated = true
+						break
+					}
+					hits = append(hits, h)
 				}
 				if truncated {
 					break
@@ -1222,55 +1349,24 @@ func runCodeExec(req ExecRequest) ExecResult {
 			return toJSArrayWithProps(vm, hits, props)
 		},
 		"grepFn": func(call goja.FunctionCall) goja.Value {
+			const sig = "fs.grepFn(regex, globOrOpts?, optsOrMaxFns?)"
 			if len(call.Arguments) < 1 {
-				panic(vm.NewTypeError("fs.grepFn(regex, globPattern?, optsOrMaxFns?) requires a string or RegExp as argument 1"))
+				panic(vm.NewTypeError(sig + " requires a string or RegExp as argument 1"))
 			}
-			rawPattern, re := parseRegexArg(vm, call.Arguments[0], "fs.grepFn(regex, globPattern?, optsOrMaxFns?)")
-
-			globPat := "**/*"
-			hasGlobArg := false
-			if len(call.Arguments) >= 2 && !goja.IsUndefined(call.Arguments[1]) && !goja.IsNull(call.Arguments[1]) {
-				if _, ok := call.Arguments[1].Export().(string); !ok {
-					panic(vm.NewTypeError("fs.grepFn(regex, globPattern?, optsOrMaxFns?): second argument globPattern must be a string"))
-				}
-				if s := call.Arguments[1].String(); s != "" {
-					globPat = s
-					hasGlobArg = true
-				}
-			}
-			maxFns := 8
-			maxLines := 200
-			var ignore []string
-			if len(call.Arguments) >= 3 && !goja.IsUndefined(call.Arguments[2]) && !goja.IsNull(call.Arguments[2]) {
-				arg2 := call.Arguments[2]
-				if obj, ok := arg2.(*goja.Object); ok {
-					if mv := obj.Get("maxFns"); mv != nil && !goja.IsUndefined(mv) && !goja.IsNull(mv) {
-						if n := int(mv.ToInteger()); n > 0 {
-							maxFns = n
-						}
-					}
-					if ml := obj.Get("maxLines"); ml != nil && !goja.IsUndefined(ml) && !goja.IsNull(ml) {
-						if n := int(ml.ToInteger()); n > 0 {
-							maxLines = n
-						}
-					}
-					ignore = extractStringSlice(vm, obj.Get("ignore"))
-				} else if n := int(arg2.ToInteger()); n > 0 {
-					maxFns = n
-				}
-			}
-			if maxFns > 30 {
-				maxFns = 30
+			rawPattern, re := parseRegexArg(vm, call.Arguments[0], sig)
+			opts := parseSearchCallOpts(vm, call.Arguments, sig, 8, "maxFns", "max")
+			if opts.maxCount > 30 {
+				opts.maxCount = 30
 			}
 
-			files, _, err := sb.walkFiles(globPat, 2000, ignore)
+			files, _, err := sb.walkFiles(opts.globPat, 2000, opts.ignore)
 			if err != nil {
 				panic(vm.NewGoError(err))
 			}
-			if hasGlobArg && len(files) == 0 {
+			if opts.hasGlobArg && len(files) == 0 {
 				if abs0, _, rerr := sb.resolvePath(rawPattern); rerr == nil {
 					if _, serr := os.Stat(abs0); serr == nil {
-						panic(vm.NewTypeError(fmt.Sprintf("fs.grepFn: globPattern %q matched 0 files, while first arg %q is an existing path — arguments look swapped; signature is fs.grepFn(regex, globPattern?, optsOrMaxFns?)", globPat, rawPattern)))
+						panic(vm.NewTypeError(fmt.Sprintf("fs.grepFn: globPattern %q matched 0 files, while first arg %q is an existing path — arguments look swapped; signature is %s", opts.globPat, rawPattern, sig)))
 					}
 				}
 			}
@@ -1279,33 +1375,21 @@ func runCodeExec(req ExecRequest) ExecResult {
 				Found     bool   `json:"found"`
 				File      string `json:"file"`
 				Symbol    string `json:"symbol"`
+				Receiver  string `json:"receiver,omitempty"`
 				StartLine int    `json:"startLine"`
 				EndLine   int    `json:"endLine"`
 				HitLines  []int  `json:"hitLines"`
 				Truncated bool   `json:"truncated,omitempty"`
 				Text      string `json:"text"`
 			}
-			results := make([]*grepFnEntry, 0, maxFns)
-			seen := make(map[string]*grepFnEntry)
-			truncated := false
-
-			for _, rel := range files {
-				if sb.ctx.Err() != nil {
-					break
-				}
-				abs := filepath.Join(sb.root, filepath.FromSlash(rel))
-				info, err := os.Stat(abs)
-				if err != nil || info.IsDir() || info.Size() > 2*1024*1024 {
-					continue
-				}
-				data, err := sb.readFileBytes(abs)
-				if err != nil || bytes.IndexByte(data, 0) != -1 {
-					continue
-				}
+			perFile := make([][]*grepFnEntry, len(files))
+			sb.scanFilesParallel(files, func(idx int, rel string, data []byte) {
 				lines := strings.Split(string(data), "\n")
 				var syms []symbolInfo
 				symsParsed := false
-				for idx, line := range lines {
+				local := make([]*grepFnEntry, 0, 4)
+				seen := make(map[string]*grepFnEntry)
+				for li, line := range lines {
 					if !re.MatchString(line) {
 						continue
 					}
@@ -1313,21 +1397,21 @@ func runCodeExec(req ExecRequest) ExecResult {
 						syms = extractSymbolsFromLines(rel, lines)
 						symsParsed = true
 					}
-					lineNum := idx + 1
-					fn := extractFunctionAtWithSymbols(rel, lines, syms, lineNum, maxLines)
+					lineNum := li + 1
+					fn := extractFunctionAtWithSymbols(rel, lines, syms, lineNum, opts.maxLines)
 					key := fmt.Sprintf("%s:%d:%d", rel, fn.StartLine, fn.EndLine)
 					if existing, ok := seen[key]; ok {
 						existing.HitLines = append(existing.HitLines, lineNum)
 						continue
 					}
-					if len(results) >= maxFns {
-						truncated = true
+					if len(local) >= opts.maxCount+1 {
 						break
 					}
 					entry := &grepFnEntry{
 						Found:     fn.Found,
 						File:      fn.File,
 						Symbol:    fn.Symbol,
+						Receiver:  fn.Receiver,
 						StartLine: fn.StartLine,
 						EndLine:   fn.EndLine,
 						HitLines:  []int{lineNum},
@@ -1335,6 +1419,213 @@ func runCodeExec(req ExecRequest) ExecResult {
 						Text:      fn.Text,
 					}
 					seen[key] = entry
+					local = append(local, entry)
+				}
+				perFile[idx] = local
+			})
+
+			results := make([]*grepFnEntry, 0, opts.maxCount)
+			truncated := false
+			for _, fe := range perFile {
+				for _, entry := range fe {
+					if len(results) >= opts.maxCount {
+						truncated = true
+						break
+					}
+					results = append(results, entry)
+				}
+				if truncated {
+					break
+				}
+			}
+			return toJSArrayWithProps(vm, results, map[string]any{"truncated": truncated})
+		},
+		"findSymbol": func(call goja.FunctionCall) goja.Value {
+			const sig = "fs.findSymbol(name, globOrOpts?, opts?)"
+			if len(call.Arguments) < 1 {
+				panic(vm.NewTypeError(sig + " requires a symbol name as argument 1"))
+			}
+			query := strings.TrimSpace(call.Arguments[0].String())
+			if query == "" {
+				panic(vm.NewTypeError(sig + ": symbol name cannot be empty"))
+			}
+			baseName := extractBaseSymbolName(query)
+			baseBytes := []byte(baseName)
+			opts := parseSearchCallOpts(vm, call.Arguments, sig, 20, "maxResults", "max")
+			if opts.maxCount > 100 {
+				opts.maxCount = 100
+			}
+
+			files, _, err := sb.walkFiles(opts.globPat, 2000, opts.ignore)
+			if err != nil {
+				panic(vm.NewGoError(err))
+			}
+
+			type symHit struct {
+				File      string `json:"file"`
+				Name      string `json:"name"`
+				Kind      string `json:"kind"`
+				Receiver  string `json:"receiver,omitempty"`
+				Line      int    `json:"line"`
+				EndLine   int    `json:"endLine"`
+				Truncated bool   `json:"truncated,omitempty"`
+				Text      string `json:"text,omitempty"`
+			}
+			perFile := make([][]symHit, len(files))
+			sb.scanFilesParallel(files, func(idx int, rel string, data []byte) {
+				if !bytes.Contains(data, baseBytes) {
+					return
+				}
+				lines := strings.Split(string(data), "\n")
+				syms := extractSymbolsFromLines(rel, lines)
+				var local []symHit
+				for _, sym := range syms {
+					if !matchesSymbolQuery(sym, query) {
+						continue
+					}
+					h := symHit{
+						File:     rel,
+						Name:     sym.Name,
+						Kind:     sym.Kind,
+						Receiver: sym.Receiver,
+						Line:     sym.Line,
+						EndLine:  sym.EndLine,
+					}
+					if opts.includeText {
+						fn := buildFnResult(rel, sym.Name, lines, sym.Line-1, sym.EndLine-1, opts.maxLines, nil)
+						h.Text = fn.Text
+						h.Truncated = fn.Truncated
+					}
+					local = append(local, h)
+				}
+				perFile[idx] = local
+			})
+
+			results := make([]symHit, 0, opts.maxCount)
+			truncated := false
+			for _, fh := range perFile {
+				for _, h := range fh {
+					if len(results) >= opts.maxCount {
+						truncated = true
+						break
+					}
+					results = append(results, h)
+				}
+				if truncated {
+					break
+				}
+			}
+			return toJSArrayWithProps(vm, results, map[string]any{"truncated": truncated})
+		},
+		"callers": func(call goja.FunctionCall) goja.Value {
+			const sig = "fs.callers(symbol, globOrOpts?, opts?)"
+			if len(call.Arguments) < 1 {
+				panic(vm.NewTypeError(sig + " requires a symbol name as argument 1"))
+			}
+			rawSym := strings.TrimSpace(call.Arguments[0].String())
+			baseName := extractBaseSymbolName(rawSym)
+			if baseName == "" {
+				panic(vm.NewTypeError(sig + ": symbol name cannot be empty"))
+			}
+			baseBytes := []byte(baseName)
+			wordRe := regexp.MustCompile(`\b` + regexp.QuoteMeta(baseName) + `\b`)
+			opts := parseSearchCallOpts(vm, call.Arguments, sig, 30, "maxCallers", "max")
+			if opts.maxCount > 100 {
+				opts.maxCount = 100
+			}
+
+			files, _, err := sb.walkFiles(opts.globPat, 2000, opts.ignore)
+			if err != nil {
+				panic(vm.NewGoError(err))
+			}
+
+			type callerEntry struct {
+				File      string   `json:"file"`
+				Caller    string   `json:"caller"`
+				Receiver  string   `json:"receiver,omitempty"`
+				StartLine int      `json:"startLine"`
+				EndLine   int      `json:"endLine"`
+				HitLines  []int    `json:"hitLines"`
+				Snippets  []string `json:"snippets"`
+				Text      string   `json:"text,omitempty"`
+			}
+			perFile := make([][]*callerEntry, len(files))
+			sb.scanFilesParallel(files, func(idx int, rel string, data []byte) {
+				if !bytes.Contains(data, baseBytes) {
+					return
+				}
+				lines := strings.Split(string(data), "\n")
+				var syms []symbolInfo
+				var defLines map[int]bool
+				symsParsed := false
+				local := make([]*callerEntry, 0, 4)
+				seen := make(map[string]*callerEntry)
+
+				for li, line := range lines {
+					trimmed := strings.TrimSpace(line)
+					if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "/*") || strings.HasPrefix(trimmed, "*") {
+						continue
+					}
+					if !wordRe.MatchString(line) {
+						continue
+					}
+					if !symsParsed {
+						syms = extractSymbolsFromLines(rel, lines)
+						defLines = make(map[int]bool)
+						for _, s := range syms {
+							if s.Name == baseName {
+								defLines[s.Line] = true
+							}
+						}
+						symsParsed = true
+					}
+					lineNum := li + 1
+					if defLines[lineNum] {
+						continue
+					}
+					fn := extractFunctionAtWithSymbols(rel, lines, syms, lineNum, opts.maxLines)
+					callerName := fn.Symbol
+					if !fn.Found || callerName == "" {
+						callerName = "<top-level>"
+					}
+					key := fmt.Sprintf("%s:%s:%d:%d", rel, callerName, fn.StartLine, fn.EndLine)
+					snip := trimmed
+					if len(snip) > 160 {
+						snip = snip[:160] + "..."
+					}
+					if existing, ok := seen[key]; ok {
+						existing.HitLines = append(existing.HitLines, lineNum)
+						if len(existing.Snippets) < 3 {
+							existing.Snippets = append(existing.Snippets, snip)
+						}
+						continue
+					}
+					entry := &callerEntry{
+						File:      rel,
+						Caller:    callerName,
+						Receiver:  fn.Receiver,
+						StartLine: fn.StartLine,
+						EndLine:   fn.EndLine,
+						HitLines:  []int{lineNum},
+						Snippets:  []string{snip},
+					}
+					if opts.includeText {
+						entry.Text = fn.Text
+					}
+					seen[key] = entry
+					local = append(local, entry)
+				}
+				perFile[idx] = local
+			})
+
+			results := make([]*callerEntry, 0, opts.maxCount)
+			truncated := false
+			for _, fe := range perFile {
+				for _, entry := range fe {
+					if len(results) >= opts.maxCount {
+						truncated = true
+						break
+					}
 					results = append(results, entry)
 				}
 				if truncated {
@@ -1707,8 +1998,9 @@ func runCodeExec(req ExecRequest) ExecResult {
 					panic(vm.NewTypeError("sh.check(command, optsOrFilterRegex?) requires command"))
 				}
 				filterRe := defaultCheckFailRe
-				maxMatches := 40
+				maxMatches := 50
 				tailLines := 15
+				contextLines := 3
 				if len(call.Arguments) >= 2 && !goja.IsUndefined(call.Arguments[1]) && !goja.IsNull(call.Arguments[1]) {
 					arg1 := call.Arguments[1]
 					if obj, ok := arg1.(*goja.Object); ok && obj.ClassName() != "RegExp" {
@@ -1723,6 +2015,11 @@ func runCodeExec(req ExecRequest) ExecResult {
 						if tv := obj.Get("tailLines"); tv != nil && !goja.IsUndefined(tv) && !goja.IsNull(tv) {
 							if n := int(tv.ToInteger()); n >= 0 {
 								tailLines = n
+							}
+						}
+						if cv := obj.Get("contextLines"); cv != nil && !goja.IsUndefined(cv) && !goja.IsNull(cv) {
+							if n := int(cv.ToInteger()); n >= 0 {
+								contextLines = n
 							}
 						}
 					} else {
@@ -1746,15 +2043,28 @@ func runCodeExec(req ExecRequest) ExecResult {
 				}
 				matches := make([]string, 0, 16)
 				matchCount := 0
+				captured := make(map[int]bool)
 				nonEmpty := make([]string, 0, len(allLines))
-				for _, l := range allLines {
+				for idx, l := range allLines {
 					if strings.TrimSpace(l) != "" {
 						nonEmpty = append(nonEmpty, l)
 					}
 					if filterRe.MatchString(l) {
 						matchCount++
-						if len(matches) < maxMatches {
+						if len(matches) < maxMatches && !captured[idx] {
 							matches = append(matches, l)
+							captured[idx] = true
+						}
+						added := 0
+						for j := idx + 1; j < len(allLines) && added < contextLines && len(matches) < maxMatches; j++ {
+							if strings.TrimSpace(allLines[j]) == "" {
+								continue
+							}
+							if !captured[j] {
+								matches = append(matches, allLines[j])
+								captured[j] = true
+								added++
+							}
 						}
 					}
 				}

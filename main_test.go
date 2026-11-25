@@ -887,6 +887,135 @@ func TestEditSafetyGuardsNetDiffsAndRevert(t *testing.T) {
 	}
 }
 
+func TestGoASTFindSymbolCallersFlexibleOptsAndCheckContext(t *testing.T) {
+	tmp := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(tmp, "pkg"), 0755)
+	_ = os.MkdirAll(filepath.Join(tmp, "web"), 0755)
+
+	svcGo := `package pkg
+
+type Status int
+type Alias = Status
+
+const DefaultTimeout = 30
+
+type Client struct{}
+type Server struct{}
+
+func (c *Client) Start() string {
+	return "client"
+}
+
+func (s *Server) Start() string {
+	return "server"
+}
+`
+	callerGo := `package pkg
+
+// Start is mentioned in a comment and should be skipped
+func RunAll(c *Client, s *Server) string {
+	a := c.Start()
+	b := s.Start()
+	return a + b
+}
+`
+	cfgJS := `export const SHRINE_POWERUPS = Object.freeze({
+  frost_bastion: { id: "frost_bastion" },
+});
+export const helper = () => 42;
+`
+	_ = os.WriteFile(filepath.Join(tmp, "pkg", "svc.go"), []byte(svcGo), 0644)
+	_ = os.WriteFile(filepath.Join(tmp, "pkg", "caller.go"), []byte(callerGo), 0644)
+	_ = os.WriteFile(filepath.Join(tmp, "web", "config.js"), []byte(cfgJS), 0644)
+
+	// 1. Go AST extracts receivers, type aliases, consts, and supports receiver-qualified readFn
+	resAST := runCodeExec(ExecRequest{
+		Cwd:      tmp,
+		ReadOnly: true,
+		Code: `
+			var syms = fs.symbols("pkg/svc.go");
+			var srvStart = fs.readFn("pkg/svc.go", "(*Server).Start");
+			var cliStart = fs.readFn("pkg/svc.go", "Client.Start");
+			var jsSyms = fs.symbols("web/config.js");
+			({ syms: syms, srvStart: srvStart, cliStart: cliStart, jsSyms: jsSyms });
+		`,
+	})
+	if resAST.Error != "" {
+		t.Fatalf("Go AST / JS const symbols failed: %s", resAST.Error)
+	}
+	jAST := marshalCompactNoEscape(resAST.Result)
+	if !strings.Contains(jAST, `"receiver":"*Client"`) || !strings.Contains(jAST, `"receiver":"*Server"`) || !strings.Contains(jAST, `"kind":"const","line":6,"name":"DefaultTimeout"`) || !strings.Contains(jAST, `"kind":"type","line":4,"name":"Alias"`) {
+		t.Fatalf("expected Go AST receivers/const/type alias, got: %s", jAST)
+	}
+	if !strings.Contains(jAST, `return \"server\"`) || !strings.Contains(jAST, `return \"client\"`) {
+		t.Fatalf("expected receiver-qualified readFn to distinguish Client.Start vs (*Server).Start, got: %s", jAST)
+	}
+	if !strings.Contains(jAST, `"kind":"const","line":1,"name":"SHRINE_POWERUPS"`) || !strings.Contains(jAST, `"kind":"function","line":4,"name":"helper"`) {
+		t.Fatalf("expected JS exported const and arrow fn symbols, got: %s", jAST)
+	}
+
+	// 2. fs.grep and fs.grepFn accept { glob } options object as 2nd argument
+	resOpts := runCodeExec(ExecRequest{
+		Cwd:      tmp,
+		ReadOnly: true,
+		Code: `
+			var g = fs.grep("Start", { glob: "**/*.go", maxHits: 10 });
+			var gf = fs.grepFn("Start", { glob: "**/*.go", maxFns: 5 });
+			({ gLen: g.length, gfLen: gf.length });
+		`,
+	})
+	if resOpts.Error != "" {
+		t.Fatalf("flexible { glob } options failed: %s", resOpts.Error)
+	}
+	jOpts := marshalCompactNoEscape(resOpts.Result)
+	if !strings.Contains(jOpts, `"gLen":5`) || !strings.Contains(jOpts, `"gfLen":4`) {
+		t.Fatalf("unexpected flexible opts grep/grepFn result: %s", jOpts)
+	}
+
+	// 3. fs.findSymbol and fs.callers across files
+	resNav := runCodeExec(ExecRequest{
+		Cwd:      tmp,
+		ReadOnly: true,
+		Code: `
+			var defs = fs.findSymbol("Start", { glob: "**/*.go" });
+			var srvDef = fs.findSymbol("(*Server).Start", "**/*.go", { includeText: true });
+			var callers = fs.callers("Start", "**/*.go");
+			({ defs: defs, srvDef: srvDef, callers: callers });
+		`,
+	})
+	if resNav.Error != "" {
+		t.Fatalf("findSymbol/callers failed: %s", resNav.Error)
+	}
+	jNav := marshalCompactNoEscape(resNav.Result)
+	if !strings.Contains(jNav, `"receiver":"*Server"`) || !strings.Contains(jNav, `return \"server\"`) {
+		t.Fatalf("expected findSymbol to return receiver-qualified definition with text, got: %s", jNav)
+	}
+	if !strings.Contains(jNav, `"caller":"RunAll"`) || !strings.Contains(jNav, `"hitLines":[5,6]`) || strings.Contains(jNav, `"hitLines":[3`) {
+		t.Fatalf("expected callers to group RunAll lines [5,6] and skip comment/definition lines, got: %s", jNav)
+	}
+
+	// 4. sh.check captures failure context lines after --- FAIL while keeping matchCount exact
+	resChk := runCodeExec(ExecRequest{
+		Cwd: tmp,
+		Code: `
+			var c1 = sh.check("printf '=== RUN   TestDemo\\n--- FAIL: TestDemo (0.01s)\\n    demo_test.go:42: got 1, want 2\\n    extra detail\\nPASS\\n'; exit 1");
+			var c0 = sh.check("printf '--- FAIL: TestDemo\\n    demo_test.go:42: got 1, want 2\\n'; exit 1", { contextLines: 0 });
+			({ c1: c1, c0: c0 });
+		`,
+	})
+	if resChk.Error != "" {
+		t.Fatalf("sh.check contextLines failed: %s", resChk.Error)
+	}
+	jChk := marshalCompactNoEscape(resChk.Result)
+	if !strings.Contains(jChk, `"matchCount":1`) || !strings.Contains(jChk, `demo_test.go:42: got 1, want 2`) {
+		t.Fatalf("expected sh.check to capture following assertion detail with matchCount=1, got: %s", jChk)
+	}
+	c0Matches := marshalCompactNoEscape(resChk.Result.(map[string]any)["c0"].(map[string]any)["matches"])
+	if strings.Contains(c0Matches, "demo_test.go:42") {
+		t.Fatalf("expected contextLines:0 to omit following lines, got: %s", c0Matches)
+	}
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a

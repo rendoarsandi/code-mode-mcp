@@ -38,7 +38,7 @@ type rpcResponse struct {
 const apiReference = `Code Mode MCP — JavaScript Host API (runs in sandboxed Goja JS VM):
 
 Tools:
-  code_read  -> STRICTLY READ-ONLY (fs.glob/stat/read/readLines/symbols/readFn/readFnAt/grep, git.status/diff).
+  code_read  -> STRICTLY READ-ONLY (fs.glob/stat/read/readLines/symbols/readFn/readFnAt/grep/grepFn/findSymbol/callers, git.status/diff).
                 Safe to auto-approve; zero write or shell blast radius.
   code_exec  -> Full read/write/shell with cross-file atomic staging (commits to disk only if
                 the script completes without error, or before sh.run / explicit fs.commit()).
@@ -52,14 +52,19 @@ fs (workspace-jailed to cwd):
   fs.stat(path)                          -> { exists, path, isDir, size, lines? }
   fs.read(path, startLine?, endLine?)    -> string (1-indexed inclusive line slice)
   fs.readLines(path, startLine?, end?)   -> string (1-indexed numbered lines "  12: ...")
-  fs.symbols(path)                       -> [{ name, kind, line, endLine }] (file outline without reading body)
-  fs.readFn(path, symbol, maxLines?)     -> { found, file, symbol, startLine, endLine, text, matches?, suggestions? }
-  fs.readFnAt(path, line, maxLines?)     -> { found, file, symbol, startLine, endLine, text }
+  fs.symbols(path)                       -> [{ name, kind, receiver?, line, endLine }] (Go AST for .go; exported consts/fns/classes/methods for JS/TS/Py/Rust)
+  fs.readFn(path, symbol, maxLines?)     -> { found, file, symbol, receiver?, startLine, endLine, text, matches?, suggestions? }
+                                            Supports Go receiver-qualified names e.g. "(*Client).Start" or "Client.Start".
+  fs.readFnAt(path, line, maxLines?)     -> { found, file, symbol, receiver?, startLine, endLine, text }
                                             Returns innermost enclosing function/class around 1-based line
                                             (or ±15 lines fallback context in text with found:false if top-level).
-  fs.grep(regex, glob?, optsOrMaxHits?)  -> [{ file, line, text }] (string or /RegExp/i; opts: { maxHits, ignore }; .truncated)
-  fs.grepFn(regex, glob?, optsOrMaxFns?) -> [{ found, file, symbol, startLine, endLine, hitLines, text }]
-                                            One-liner grep + deduplicated enclosing functions (default maxFns=8)
+  fs.grep(regex, globOrOpts?, opts?)     -> [{ file, line, text }] (parallel; accepts glob string OR { glob, maxHits, ignore }; .truncated)
+  fs.grepFn(regex, globOrOpts?, opts?)   -> [{ found, file, symbol, receiver?, startLine, endLine, hitLines, text }]
+                                            Parallel grep + deduplicated enclosing functions (default maxFns=8; accepts glob string OR { glob, maxFns, maxLines, ignore })
+  fs.findSymbol(name, globOrOpts?, opts?)-> [{ file, name, kind, receiver?, line, endLine, text? }]
+                                            Fast cross-file symbol definition lookup (supports Go "(*Type).Method"; pass { includeText: true } for bodies)
+  fs.callers(symbol, globOrOpts?, opts?) -> [{ file, caller, receiver?, startLine, endLine, hitLines, snippets, text? }]
+                                            Whole-word caller lookup across files, skipping definitions & comments, grouped by enclosing function
   fs.edit(path, target, replacement, opts?)
                                          -> { changed, occurrences, file, dryRun, diff? }
                                             opts: { optional?, replaceAll?, wholeWord?, expectCount?, maxReplacements? }
@@ -78,6 +83,7 @@ git:
 sh (code_exec only, when allowShell !== false):
   sh.run(command)                        -> { code, stdout, stderr, timedOut }
   sh.check(command, optsOrFilterRegex?)  -> { ok, code, timedOut, totalLines, matchCount, matches, tail }
+                                            opts: { filter?, maxMatches?, tailLines?, contextLines? (default 3) }
 
 Notes:
   - Cross-file edits are ATOMIC by default (atomic: true): if file #2 throws, file #1 is rolled back and disk stays untouched.
@@ -85,21 +91,21 @@ Notes:
   - Set dryRun: true to preview fs.edit / fs.editLines / fs.write diffs without modifying disk.
   - diffMode: "auto" (default: compact ±3-line unified diff for small edits within inline budget, auto-falling back to stat), "stat", "compact", "full", or "none".
   - Set allowShell: false for pure read/edit sandboxing with zero shell execution.
-  - Timeout defaults to 15000ms for code_read / 45000ms for code_exec (max 300000ms); stdout defaults to 9200 bytes (max 65536) in plain text to stay inline without spillover.`
+  - Timeout defaults to 15000ms for code_read / 90000ms for code_exec (max 300000ms); stdout defaults to 9200 bytes (max 65536) in plain text to stay inline without spillover.`
 
-const serverInstructions = "Use code_read for strictly read-only multi-file discovery, audits, symbols/readFn/readFnAt/grepFn, and git checks. Use code_exec for builds/tests via sh.run/sh.check or atomic bulk edits. Keep stdout concise (default 9200-byte plain-text cap with head+tail preservation and outputId pagination); use native read_file for large >150-line verbatim reads."
+const serverInstructions = "Use code_read for strictly read-only multi-file discovery, audits, symbols/readFn/readFnAt/grepFn/findSymbol/callers, and git checks. Use code_exec for builds/tests via sh.run/sh.check or atomic bulk edits. Keep stdout concise (default 9200-byte plain-text cap with head+tail preservation and outputId pagination); use native read_file for large >150-line verbatim reads."
 
 func toolsList() []map[string]any {
 	return []map[string]any{
 		{
 			"name":        "code_read",
-			"description": "Execute a STRICTLY READ-ONLY sandboxed JavaScript script (Goja VM) for fast multi-file glob, grep, grepFn, stat, read, readLines, symbols, readFn, readFnAt, and git.status/diff. No file writes and no shell execution — safe to auto-approve.",
+			"description": "Execute a STRICTLY READ-ONLY sandboxed JavaScript script (Goja VM) for fast parallel multi-file glob, grep, grepFn, findSymbol, callers, stat, read, readLines, symbols, readFn, readFnAt, and git.status/diff. No file writes and no shell execution — safe to auto-approve.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"code": map[string]any{
 						"type":        "string",
-						"description": "Read-only JavaScript source (omit when reading a cached chunk via outputId). Globals: print, console.log, out.{used,limit,remaining,truncated}, fs.{glob,stat,read,readLines,symbols,readFn,readFnAt,grep,grepFn}, git.{status,diff}.",
+						"description": "Read-only JavaScript source (omit when reading a cached chunk via outputId). Globals: print, console.log, out.{used,limit,remaining,truncated}, fs.{glob,stat,read,readLines,symbols,readFn,readFnAt,grep,grepFn,findSymbol,callers}, git.{status,diff}.",
 					},
 					"cwd": map[string]any{
 						"type":        "string",
@@ -126,13 +132,13 @@ func toolsList() []map[string]any {
 		},
 		{
 			"name":        "code_exec",
-			"description": "Execute a sandboxed JavaScript script in a Go-hosted JS VM (Goja) to batch multi-file reads, atomic cross-file edits (fs.edit with wholeWord/expectCount/maxReplacements, fs.editLines with expectStart/expectEnd, fs.write, fs.revert, net-per-file diffs & dryRun), git checks, and shell commands (sh.run, sh.check) in one tool call.",
+			"description": "Execute a sandboxed JavaScript script in a Go-hosted JS VM (Goja) to batch multi-file reads, symbol/caller discovery, atomic cross-file edits (fs.edit with wholeWord/expectCount/maxReplacements, fs.editLines with expectStart/expectEnd, fs.write, fs.revert, net-per-file diffs & dryRun), git checks, and shell commands (sh.run, sh.check) in one tool call.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"code": map[string]any{
 						"type":        "string",
-						"description": "JavaScript source to execute. Globals: print, console.log, out.{used,limit,remaining,truncated}, fs.{glob,stat,read,readLines,symbols,readFn,readFnAt,grep,grepFn,edit,editLines,write,commit,revert}, git.{status,diff}, sh.{run,check}. Cross-file edits are staged atomically and rolled back on any uncaught error.",
+						"description": "JavaScript source to execute. Globals: print, console.log, out.{used,limit,remaining,truncated}, fs.{glob,stat,read,readLines,symbols,readFn,readFnAt,grep,grepFn,findSymbol,callers,edit,editLines,write,commit,revert}, git.{status,diff}, sh.{run,check}. Cross-file edits are staged atomically and rolled back on any uncaught error.",
 					},
 					"cwd": map[string]any{
 						"type":        "string",
@@ -157,7 +163,7 @@ func toolsList() []map[string]any {
 					},
 					"timeoutMs": map[string]any{
 						"type":        "integer",
-						"description": "Execution timeout in milliseconds (default 45000 for builds/tests, max 300000).",
+						"description": "Execution timeout in milliseconds (default 90000 for builds/tests, max 300000).",
 					},
 					"maxOutputBytes": map[string]any{
 						"type":        "integer",
